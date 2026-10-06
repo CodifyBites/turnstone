@@ -1635,12 +1635,14 @@ The output guard scans a bounded window of a task-agent child result that
 reaches past the child's clip, so a credential straddling the clip boundary is
 seen whole and redacted while a tool server never controls how much text the
 guard scans; a capture's window is rendered from its source in the head mode
-the clip uses, so the guard scans exactly the text the agent will receive. The
-window is itself clipped
-with the result's true size before the guard runs, so a redaction that shrinks
-it below the clip still leaves the result marked as cut, and the recall
-projection of the step carries that same size. Provider tool names are
-normalized before any of these policies are looked up.
+the clip uses, so the text the agent receives is a prefix of the text the guard
+scanned. The window is itself clipped with the result's true size before the
+guard runs, so a redaction that shrinks it below the clip still leaves the
+result marked as cut, and the recall projection of the step carries that same
+size. Because the guard reads past the clip, a finding on a result the clip
+then cuts may concern text the agent never receives, and the agent's advisory
+says so. Provider tool names are normalized before any of these policies are
+looked up.
 
 #### Surface-specific policies
 
@@ -1707,9 +1709,10 @@ wire-invisible `TurnMeta`.
 blocks that cannot be normalized safely. It replays only to its producing
 provider; another provider rebuilds the request from neutral fields. Signed,
 encrypted, and structured blocks remain opaque, while trust-boundary lowering
-copies and defangs editable top-level text so native replay cannot resurrect a
-forged session marker. Attachment bytes never ride in a `Turn`; each output
-boundary resolves its ordered references from the blob store.
+copies and defangs editable top-level text, removing the session's trusted
+tokens from it, so native replay cannot resurrect a forged session marker.
+Attachment bytes never ride in a `Turn`; each output boundary resolves its
+ordered references from the blob store.
 
 Storage rehydrates canonical Turns, and `model_turn()` is the sole lowering and
 re-ingest boundary. OpenAI-like dict adapters remain a compatibility bridge for

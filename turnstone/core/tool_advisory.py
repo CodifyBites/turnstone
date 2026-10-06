@@ -18,7 +18,10 @@ framing for a drained queued message).
 
 from __future__ import annotations
 
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final
+
+if TYPE_CHECKING:
+    from turnstone.core.output_guard import OutputAssessment
 
 # Priority constants
 PRIORITY_IMPORTANT: Final = "important"
@@ -57,17 +60,23 @@ _USER_INTERJECTION_BODY_MARKER: Final = "\n\nUser message: "
 def render_output_guard_text(meta: dict[str, Any]) -> str:
     """Render an ``output_guard`` system turn's text from its structured *meta*.
 
-    *meta* carries ``{flags, risk_level, annotations, redacted}``.  Returns the
+    *meta* carries ``{flags, risk_level, annotations, redacted}``, and
+    ``result`` when the finding is about one of several results.  Returns the
     operator/model-facing prose — the flag list + risk level, one indented line
     per annotation, and (when credentials were redacted) the do-not-reconstruct
     notice.  This is the text projection of the structured guard finding: the
-    producer (``ChatSession._collect_advisories``) builds *meta* and derives the
-    turn ``content`` from it via this function, so the wire text and the FE
+    producer (:func:`output_guard_advisory`) builds *meta* and derives the turn
+    ``content`` from it via this function, so the wire text and the FE
     guard-finding card cannot drift (both read the same *meta*).
     """
     flags = meta.get("flags") or []
     risk_level = str(meta.get("risk_level") or "none")
-    lines = [f"Output guard: {', '.join(flags)} ({risk_level.upper()})"]
+    result = meta.get("result")
+    where = ""
+    if isinstance(result, dict):
+        tool = f", {result['tool']}" if result.get("tool") else ""
+        where = f" (result {result['index']} of {result['count']}{tool})"
+    lines = [f"Output guard{where}: {', '.join(flags)} ({risk_level.upper()})"]
     for ann in meta.get("annotations") or []:
         lines.append(f"  {ann}")
     if meta.get("redacted"):
@@ -75,6 +84,50 @@ def render_output_guard_text(meta: dict[str, Any]) -> str:
             "Credentials have been redacted. Do not attempt to reconstruct redacted values."
         )
     return "\n".join(lines)
+
+
+# Added to an output_guard advisory when the result was cut after the guard read
+# it.  The task-agent guard reads past the clip so it can redact a credential
+# that straddles it, so a finding can concern text the model never receives.
+OUTPUT_GUARD_CUT_NOTICE: Final = (
+    "Part of this result was cut before you received it; the finding may concern that part."
+)
+
+
+def output_guard_advisory(
+    assessment: OutputAssessment,
+    *,
+    cut: bool = False,
+    index: int = 1,
+    count: int = 1,
+    tool: str = "",
+) -> tuple[str, dict[str, Any]]:
+    """Return an ``output_guard`` system turn's text and its structured *meta*.
+
+    Both loops build their advisory here, so one assessment reads the same in
+    either.  The meta is the source of truth: the text derives from it through
+    :func:`render_output_guard_text`, and the FE guard-finding card renders the
+    same meta, so the two cannot drift.  ``cut`` appends
+    :data:`OUTPUT_GUARD_CUT_NOTICE`.
+
+    Every advisory of a step follows the step's last tool result, since a turn's
+    results must stay together on the wire.  When the step returned several,
+    the advisory names its own by position among them (*index* of *count*, from
+    1) and by *tool*, the registered name of the tool that produced it; one
+    result needs no label.
+    """
+    annotations = list(assessment.annotations)
+    if cut:
+        annotations.append(OUTPUT_GUARD_CUT_NOTICE)
+    meta: dict[str, Any] = {
+        "flags": list(assessment.flags),
+        "risk_level": assessment.risk_level,
+        "annotations": annotations,
+        "redacted": assessment.sanitized is not None,
+    }
+    if count > 1:
+        meta["result"] = {"index": index, "count": count, "tool": tool}
+    return render_output_guard_text(meta), meta
 
 
 def render_user_interjection(message: str, priority: str) -> str:

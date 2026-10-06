@@ -189,7 +189,7 @@ def test_lowered_fence_markers_are_not_resurrected_from_native_text():
     messages = [
         {"role": "assistant", "content": text, "_provider_content": [_message(text, "commentary")]}
     ]
-    lowered = [neutralize_message_fence_markers(messages[0], "system-reminder_testnonce")]
+    lowered = [neutralize_message_fence_markers(messages[0], "system-reminder_testnonce", token="")]
     assert lowered[0]["content"] != text
     _, items = OpenAIResponsesProvider._convert_messages(lowered)
     assert items == [{"type": "message", "role": "assistant", "content": lowered[0]["content"]}]

@@ -397,10 +397,14 @@ def fold_system_turns(
 
     Forgery defence is two-layer: ``fence.wrap`` neutralises the operator body's
     closing marker (break-out), and every untrusted non-system text host is
-    neutralised before any real fence is appended (forge-in).  This includes
-    terminal hosts with no following operator turn and native lanes that inherit
-    a non-native primary's trust declaration during fallback.  The host pass runs
-    before folding so it can never defang a real fence appended here.
+    neutralised before any real fence is appended (forge-in): its markers are
+    defanged and the session's token itself is removed, so of the text this pass
+    sees, only a fence it appends carries the token.  This includes terminal
+    hosts with no following operator turn and native lanes that inherit a
+    non-native primary's trust declaration during fallback.  The host pass runs
+    before folding so it can never defang a real fence appended here.  An
+    attachment, which joins the request later, is cleaned where it joins; text
+    inside an image or a natively read PDF is beyond the reach of any text pass.
 
     Native models (*supports_mid_conversation_system*) keep the turns inline —
     the provider converter emits them as real ``system`` messages.  Base-prompt
@@ -408,11 +412,14 @@ def fold_system_turns(
     fold onto the shared predecessor in order, so the wire never carries two
     adjacent ``system`` messages.  An operator turn with no predecessor (should
     not occur — they follow the turn they relate to) is kept standalone so
-    nothing is silently dropped.  An operator turn whose predecessor is an
-    *assistant* turn is a contract violation (operator context must ride a
-    user/tool input turn, not the model's own output): it is logged, not raised —
-    it degrades to a fold, since the nonce still gates trust regardless of host
-    turn.
+    nothing is silently dropped.  One whose predecessor is a base-prompt system
+    message (an operator turn first in the trajectory, such as a ``/skill`` hint
+    on an empty session) folds into that trusted message as it stands: the
+    declaration it carries names the token.  An operator turn whose predecessor
+    is an *assistant* turn is a contract violation (operator context must ride a
+    user/tool input turn, not the model's own output): it is logged, not raised
+    — it degrades to a fold, since the nonce still gates trust regardless of
+    host turn.
 
     Returns a transient copy as wire dicts; the input is untouched.  The fold's
     content-merge / host-escape logic keys directly on the wire content shape.
@@ -420,7 +427,7 @@ def fold_system_turns(
     safe_messages: list[dict[str, Any]] | None = None
     for idx, msg in enumerate(messages):
         safe = (
-            neutralize_message_fence_markers(msg, fence.SYSTEM_REMINDER_TAG)
+            neutralize_message_fence_markers(msg, fence.SYSTEM_REMINDER_TAG, token=nonce)
             if msg.get("role") != "system"
             else msg
         )
@@ -432,7 +439,6 @@ def fold_system_turns(
     if supports_mid_conversation_system:
         return prepared
     out: list[dict[str, Any]] = []
-    host_escaped = False  # has out[-1] had its untrusted markers defanged?
     for msg in prepared:
         if msg.get("role") == "system" and msg.get("_source"):
             raw = msg.get("content")
@@ -456,21 +462,19 @@ def fold_system_turns(
                         "user/tool turn",
                         msg.get("_source"),
                     )
-                if not host_escaped:
-                    out[-1] = neutralize_message_fence_markers(out[-1], fence.SYSTEM_REMINDER_TAG)
-                    host_escaped = True
                 out[-1] = _append_text_block(out[-1], wrapped)
             else:
                 out.append(msg)
             continue
         out.append(msg)
-        host_escaped = msg.get("role") != "system"
     return out
 
 
 def neutralize_message_fence_markers(
     msg: dict[str, Any],
     tag: str,
+    *,
+    token: str,
 ) -> dict[str, Any]:
     """Return a copy of *msg* with *tag* fence markers defanged in plaintext.
 
@@ -481,11 +485,20 @@ def neutralize_message_fence_markers(
     mirror.  Signed thinking, encrypted reasoning/server-tool blocks, tool-use
     structures, and other opaque native content remain byte-exact.  Trusted
     system messages are excluded by callers.  Never mutates *msg*.
+
+    *token*, the fence's session token, is also removed wherever it appears
+    (:func:`turnstone.core.fence.remove_token`): the declarations trust a block
+    by its token alone, and a leaked copy can come back inside a marker spelled
+    with invisible or lookalike characters that the defang does not match.
     """
+
+    def _safe(text: str) -> str:
+        return fence.remove_token(fence.neutralize(text, tag, opening=True), token)
+
     updates: dict[str, Any] = {}
     content = msg.get("content")
     if isinstance(content, str):
-        safe = fence.neutralize(content, tag, opening=True)
+        safe = _safe(content)
         if safe != content:
             updates["content"] = safe
     elif isinstance(content, list):
@@ -497,7 +510,7 @@ def neutralize_message_fence_markers(
                 and isinstance(part.get("text"), str)
             ):
                 text = part["text"]
-                safe = fence.neutralize(text, tag, opening=True)
+                safe = _safe(text)
                 if safe != text:
                     if safe_parts is None:
                         safe_parts = list(content)
@@ -515,7 +528,7 @@ def neutralize_message_fence_markers(
                 and isinstance(block.get("text"), str)
             ):
                 text = block["text"]
-                safe = fence.neutralize(text, tag, opening=True)
+                safe = _safe(text)
                 if safe != text:
                     if safe_blocks is None:
                         safe_blocks = list(provider_content)

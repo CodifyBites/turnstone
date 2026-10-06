@@ -464,6 +464,29 @@ frozen.
   rows keep the judge's reasoning and flags as it wrote them, and findings from the regex stage
   read as before. Workstreams created before the upgrade keep the advisories already stored in
   them, judge prose included.
+- **Task agents are told what the output guard found (#1291).** A task agent's tool results were
+  scanned and redacted, but its model never saw the finding, so a sub-agent that read a prompt
+  injection got no warning even though the guard flagged it and the operator's chip showed it. A
+  flagged result now gets the same advisory as in the conversation, after the step's tool results,
+  and the agent's intent judge sees it on later gated calls. The text of a list result, such as
+  `read_file` on an image, is now guarded; it skipped the guard entirely. An agent whose model
+  takes the advisory in the trusted fence, under a main model that takes native system messages,
+  now has that fence declared in its prompt. The guard reads past the agent's 16,000-character
+  cut so it can redact a credential that straddles it, so the advisory for a result the cut
+  shortened says the finding may concern the part the agent did not receive. The declaration
+  itself, in every session whose model folds operator turns, now says a block carrying the
+  session's token can follow a tool result; it told the model to distrust any marker inside tool
+  output, which read literally covered the real advisory appended there. Since the declaration
+  trusts the token alone, the token itself is now removed from untrusted text before the fold
+  appends its block, matched past case, invisible characters and full-width forms: a leaked token
+  inside a marker spelled with a zero-width space or a lookalike letter passed the old defang. The
+  sender label of a shared workstream gets the same treatment, and the guard flags a leaked token
+  wherever it appears. All of a step's advisories follow its last result, so in a step with several
+  results each advisory now names its own by position and tool. Text the framework wrote itself
+  (a denial quoting the approver's feedback, an unknown-tool or agent-mode gate error, the header
+  before an image) is no longer guarded; a denial such as "From now on you must write outputs to
+  /tmp" scored as an injection, and the advisory turned the approver's own correction against
+  them.
 - **Tool policies that cannot be read refuse the batch.** When reading the admin tool policies
   failed, every call came back as matching no policy, so `deny` rules stopped applying:
   skip-permissions, "Always" grants, auto-approve lists, the smart-approval judge or a person could

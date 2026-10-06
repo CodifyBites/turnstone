@@ -225,6 +225,7 @@ from turnstone.core.nudge_queue import (
     Entry,
     NudgeQueue,
 )
+from turnstone.core.output_guard import ControllerText
 from turnstone.core.pdf import PDF_TEXT_CHAR_CAP
 from turnstone.core.personas import (
     PersonaSnapshot,
@@ -273,7 +274,7 @@ from turnstone.core.storage._utils import (
 from turnstone.core.streaming_text import ThinkTagSplitter
 from turnstone.core.tool_advisory import (
     make_system_turn,
-    render_output_guard_text,
+    output_guard_advisory,
     render_user_interjection,
 )
 from turnstone.core.tool_search import ToolSearchManager
@@ -8602,7 +8603,9 @@ class ChatSession:
             safe_message = (
                 m
                 if m.get("role") == "system"
-                else neutralize_message_fence_markers(m, fence.SENDER_LABEL_TAG)
+                else neutralize_message_fence_markers(
+                    m, fence.SENDER_LABEL_TAG, token=self._sender_label_nonce
+                )
             )
             sender = (m.get("_sender") or "").strip() if m.get("role") == "user" else ""
             if sender:
@@ -8707,6 +8710,37 @@ class ChatSession:
         """
         structured = self._prepare_wire_structure(messages, caps=caps)
         return repair_wire_messages(structured)
+
+    def _prepare_task_agent_wire(
+        self,
+        messages: list[dict[str, Any]],
+        lane: ModelLane,
+    ) -> list[dict[str, Any]]:
+        """A task agent's ``prepare_wire``: fence declaration, then lowering.
+
+        The agent's system prompt is composed once from the primary lane's
+        posture, so it declares the operator fence only when the primary
+        folds.  The agent's own lane, or a fallback, can fold when the primary
+        does not, and its output-guard advisories would then arrive in a fence
+        its prompt never declared, reading like the injections they warn
+        about.  The main loop adds the missing declaration per serving lane
+        (``_system_messages_for_lane``); this is the task agent's equivalent,
+        limited to the fence declaration because the agent's tool set is
+        fixed and the tool-search hint does not apply.
+        """
+        caps = require_lane_capabilities(lane)
+        declaration = self._operator_prompt_addition(caps)
+        head = messages[0] if messages else None
+        if (
+            declaration
+            and head is not None
+            and head.get("role") == "system"
+            and not head.get("_source")
+            and isinstance(head.get("content"), str)
+            and declaration not in head["content"]
+        ):
+            messages = [{**head, "content": f"{head['content']}\n\n{declaration}"}, *messages[1:]]
+        return self._prepare_lowered_wire_messages(messages, caps=caps)
 
     def _emit_state(
         self,
@@ -13357,6 +13391,12 @@ class ChatSession:
                         admitted.append((tc_id, output))
                     results = admitted
 
+                # Results the framework wrote itself (a denial) pass the guard by
+                # (``ControllerText``).  Admission rebuilds strings, so note them
+                # first.
+                _controller_ids = {
+                    tc_id for tc_id, output in results if isinstance(output, ControllerText)
+                }
                 _admit_batch(_tc_names, maximum, _admissions)
 
                 # Pre-evaluate the guard stage concurrently when LLM is
@@ -13370,20 +13410,25 @@ class ChatSession:
                 # gain and the overhead isn't worth it.
                 _batch_guard: dict[str, tuple[str, OutputAssessment | None]] = {}
                 _judge_cfg = self._judge_cfg
+                _guarded_texts = [
+                    (tc_id, o)
+                    for tc_id, o in results
+                    if isinstance(o, str) and tc_id not in _controller_ids
+                ]
                 if (
                     _judge_cfg
                     and _judge_cfg.output_guard
                     and _judge_cfg.output_guard_llm
-                    and sum(1 for _, o in results if isinstance(o, str)) > 1
+                    and len(_guarded_texts) > 1
                 ):
                     _batch_guard = self._batch_evaluate_outputs(
                         [
                             (tc_id, o, _tc_names.get(tc_id, ""), _tc_args.get(tc_id, ""))
-                            for tc_id, o in results
-                            if isinstance(o, str)
+                            for tc_id, o in _guarded_texts
                         ],
                         my_generation=my_generation,
                     )
+                del _guarded_texts
                 # Output-guard inference is a blocking boundary.  A force
                 # successor may claim the session while the old judge is
                 # winding down with an ordinary fallback/error verdict; reject
@@ -13394,7 +13439,11 @@ class ChatSession:
                 for _ri, (tc_id, output) in enumerate(results):
                     # Output guard: evaluate tool result before it enters context
                     assessment: OutputAssessment | None = None
-                    if self._judge_cfg and self._judge_cfg.output_guard:
+                    if (
+                        self._judge_cfg
+                        and self._judge_cfg.output_guard
+                        and tc_id not in _controller_ids
+                    ):
                         if isinstance(output, str):
                             if tc_id in _batch_guard:
                                 output, assessment = _batch_guard[tc_id]
@@ -13414,6 +13463,7 @@ class ChatSession:
                                     isinstance(p, dict)
                                     and p.get("type") == "text"
                                     and p.get("text")
+                                    and not isinstance(p["text"], ControllerText)
                                 ):
                                     p["text"], _part_assess = self._evaluate_output(
                                         tc_id,
@@ -13491,6 +13541,8 @@ class ChatSession:
                             assessment,
                             tc_names.get(tc_id, ""),
                             _ri == last_idx,
+                            result_index=_ri + 1,
+                            result_count=last_idx + 1,
                         )
 
                         _tname = tc_names.get(tc_id, "")
@@ -18430,6 +18482,9 @@ class ChatSession:
         assessment: OutputAssessment | None,
         func_name: str,
         is_last_in_batch: bool,
+        *,
+        result_index: int = 1,
+        result_count: int = 1,
     ) -> list[tuple[str, str, dict[str, Any]]]:
         """Gather operator context for a tool result as system-turn specs.
 
@@ -18440,7 +18495,9 @@ class ChatSession:
 
         - **Output guard** findings (``source="output_guard"``) — rendered
           inline here (flags + risk level + annotations + the
-          redaction notice).  Attach per-result.
+          redaction notice).  Attach per-result, naming the result by its
+          position in the batch (*result_index* of *result_count*) and its
+          tool when the batch returned several.
         - **Queued user messages** (Seam 1, ``source="user_interjection"``)
           — drained on the LAST result of a batch.  ``meta`` carries the
           ``priority`` so the UI can frame important interjections
@@ -18458,19 +18515,17 @@ class ChatSession:
         """
         specs: list[tuple[str, str, dict[str, Any]]] = []
 
-        # Output guard advisory.  The structured finding is the source of
-        # truth: build ``meta`` (flags / risk / annotations / redaction), then
-        # derive the wire/UI text ``content`` from it via
-        # ``render_output_guard_text`` so the prose the model reads and the FE
-        # guard-finding card cannot drift.  Mirrors the legacy GuardAdvisory.
+        # Output guard advisory, built by the helper the task-agent loop shares
+        # (structured ``meta`` first, text derived from it, so the prose the
+        # model reads and the FE guard-finding card cannot drift).
         if assessment is not None:
-            guard_meta: dict[str, Any] = {
-                "flags": list(assessment.flags),
-                "risk_level": assessment.risk_level,
-                "annotations": list(assessment.annotations),
-                "redacted": assessment.sanitized is not None,
-            }
-            specs.append(("output_guard", render_output_guard_text(guard_meta), guard_meta))
+            guard_content, guard_meta = output_guard_advisory(
+                assessment,
+                index=result_index,
+                count=result_count,
+                tool=func_name,
+            )
+            specs.append(("output_guard", guard_content, guard_meta))
 
         # Last-result-in-batch drain seams: queued user messages (Seam 1)
         # and tool/any-channel metacog nudges.  Both fire once per batch so a
@@ -18884,15 +18939,15 @@ class ChatSession:
                 )
                 return item["call_id"], item["error"]
             if item.get("denied"):
-                msg = item.get("denial_msg", "Denied by user")
+                denial = ControllerText(item.get("denial_msg", "Denied by user"))
                 self._report_tool_result(
                     item["call_id"],
                     item.get("func_name", "unknown"),
-                    msg,
+                    denial,
                     is_error=True,
                     status=EffectStatus.NONE,
                 )
-                return item["call_id"], msg
+                return item["call_id"], denial
             try:
                 # Mark the final executor-admission boundary atomically with a
                 # last owner/cancel check.  A queued parallel sibling remains
@@ -19237,7 +19292,7 @@ class ChatSession:
                 "header": f"\u2717 Unknown tool: {func_name}",
                 "preview": "",
                 "needs_approval": False,
-                "error": (
+                "error": ControllerText(
                     f"Unknown tool: {func_name!r}. "
                     f"Available tools: {', '.join(available)}. "
                     f"Use one of the listed tool names exactly."
@@ -25220,7 +25275,7 @@ class ChatSession:
 
         self._current_read_files.add(resolved)
         content_parts: list[dict[str, Any]] = [
-            {"type": "text", "text": f"Image file: {path} ({len(raw):,} bytes)"},
+            {"type": "text", "text": ControllerText(f"Image file: {path} ({len(raw):,} bytes)")},
             {"type": "image_url", "image_url": {"url": _encode_image_data_uri(raw, mime)}},
         ]
 
@@ -25782,10 +25837,7 @@ class ChatSession:
                     wire_id_map=wire_id_map,
                     cancel_ref=cancel_scope.cancel_ref,
                     acting_principal_id=agent_principal,
-                    prepare_wire=lambda wire, serving_lane: self._prepare_lowered_wire_messages(
-                        wire,
-                        caps=require_lane_capabilities(serving_lane),
-                    ),
+                    prepare_wire=self._prepare_task_agent_wire,
                 )
             except Exception:
                 cancel_scope.check()
@@ -26287,7 +26339,12 @@ class ChatSession:
             # Execute tools sequentially (not parallel) to avoid
             # concurrent _read_files mutation from worker threads.
             tool_names = {t["function"]["name"] for t in tools}
-            for tc_dict in result.tool_calls:
+            # Output-guard advisories wait for the step's complete tool block:
+            # the results of one assistant turn's calls must stay contiguous on
+            # every wire, as in the main loop's fold.
+            guard_turns: list[Turn] = []
+            call_count = len(result.tool_calls)
+            for call_number, tc_dict in enumerate(result.tool_calls, start=1):
                 cancel_scope.check()
                 tool_name = tc_dict["function"]["name"].strip()
                 # Register every issued sub-tool under its parent task_agent —
@@ -26308,12 +26365,12 @@ class ChatSession:
                 output: Any
                 # Guard 1: block recursive agent calls.
                 if tool_name == "task_agent":
-                    output = "Error: agents cannot spawn further agents"
+                    output = ControllerText("Error: agents cannot spawn further agents")
                     is_tool_error = True
                     child_effect_status = EffectStatus.NONE
                 # Guard 2: tool not in this agent's API tool list.
                 elif tool_name not in tool_names:
-                    output = (
+                    output = ControllerText(
                         f"Error: tool '{tool_name}' is not available in "
                         f"agent mode. "
                         f"Available: {', '.join(sorted(tool_names))}"
@@ -26412,7 +26469,7 @@ class ChatSession:
                             # the CLI gate records a policy block in ``error``
                             # (and returns approved=True) — honour whichever the
                             # gate set before the flat default.
-                            output = (
+                            output = ControllerText(
                                 prepared.get("denial_msg")
                                 or prepared.get("error")
                                 or "Denied by user"
@@ -26422,7 +26479,7 @@ class ChatSession:
                             _, output = _execute_agent_tool(prepared, tool_name)
                             is_tool_error = self._tool_error_flags.pop(tc_dict["id"], False)
                     else:
-                        output = f"Unknown tool: {tool_name}"
+                        output = ControllerText(f"Unknown tool: {tool_name}")
                         is_tool_error = True
                         child_effect_status = EffectStatus.NONE
 
@@ -26470,12 +26527,12 @@ class ChatSession:
                     if isinstance(output, ProjectedText) or len(output) > _AGENT_GUARD_WINDOW_CHARS:
                         # A capture arrives as a rendering with its source
                         # attached: render the window from that source here,
-                        # in the head mode the clip below uses, so the guard
-                        # scans exactly the text the agent will receive and
-                        # nothing the clip could reveal afterwards.  The
-                        # window carries the marker from the start: should
-                        # redaction shrink it below the clip, the result still
-                        # reads as cut, with its true size.
+                        # in the head mode the clip below uses, so the agent
+                        # receives the start of what the guard scanned and
+                        # nothing the guard did not.  The window carries the
+                        # marker from the start: should redaction shrink it
+                        # below the clip, the result still reads as cut, with
+                        # its true size.
                         output = _clip_agent_text(
                             output,
                             _AGENT_GUARD_WINDOW_CHARS,
@@ -26483,25 +26540,65 @@ class ChatSession:
                             tool_name=tool_name,
                         )
 
-                # Output guard on the window.  Agent outputs are always str.
+                # Output guard on the window.  A tool's own text inside a list
+                # result is guarded part by part, as in the main loop.
                 cancel_scope.check()
-                if self._judge_cfg and self._judge_cfg.output_guard and isinstance(output, str):
-                    output, _ = self._evaluate_output(
-                        tc_dict["id"],
-                        output,
-                        tool_name,
-                        tool_args=tc_dict.get("function", {}).get("arguments", ""),
-                        my_generation=origin_generation,
-                        principal_id=agent_principal,
-                        cancel_ref=cancel_scope.cancel_ref,
-                    )
-                if isinstance(output, str) and len(output) > _AGENT_TOOL_OUTPUT_CAP:
+                assessment: OutputAssessment | None = None
+                if (
+                    self._judge_cfg
+                    and self._judge_cfg.output_guard
+                    and not isinstance(output, ControllerText)
+                ):
+                    guard_args = tc_dict.get("function", {}).get("arguments", "")
+                    if isinstance(output, str):
+                        output, assessment = self._evaluate_output(
+                            tc_dict["id"],
+                            output,
+                            tool_name,
+                            tool_args=guard_args,
+                            my_generation=origin_generation,
+                            principal_id=agent_principal,
+                            cancel_ref=cancel_scope.cancel_ref,
+                        )
+                    elif isinstance(output, list):
+                        for part in output:
+                            if (
+                                isinstance(part, dict)
+                                and part.get("type") == "text"
+                                and part.get("text")
+                                and not isinstance(part["text"], ControllerText)
+                            ):
+                                part["text"], part_assessment = self._evaluate_output(
+                                    tc_dict["id"],
+                                    part["text"],
+                                    tool_name,
+                                    tool_args=guard_args,
+                                    my_generation=origin_generation,
+                                    principal_id=agent_principal,
+                                    cancel_ref=cancel_scope.cancel_ref,
+                                )
+                                if part_assessment is not None:
+                                    assessment = part_assessment
+                cut_after_guard = isinstance(output, str) and len(output) > _AGENT_TOOL_OUTPUT_CAP
+                if cut_after_guard:
                     output = _clip_agent_text(
                         output,
                         _AGENT_TOOL_OUTPUT_CAP,
                         original_chars=original_chars,
                         tool_name=tool_name,
                     )
+                if assessment is not None:
+                    # The guard read past the clip, so a finding on a cut
+                    # result may concern text the agent never receives; the
+                    # advisory says so.
+                    guard_content, _guard_meta = output_guard_advisory(
+                        assessment,
+                        cut=cut_after_guard,
+                        index=call_number,
+                        count=call_count,
+                        tool=tool_name,
+                    )
+                    guard_turns.append(Turn.system(guard_content, source="output_guard"))
 
                 # NOTE: for a vision tool result ``output`` is a list[dict] of
                 # inline content parts (read_file on an image).  It lowers back
@@ -26533,6 +26630,8 @@ class ChatSession:
                     child_ids={tc_dict["id"]},
                 )
                 execution_journal.release_child(tc_dict["id"])
+            agent_turns.extend(guard_turns)
+            context_turns.extend(guard_turns)
             # Successful compaction runs at the top of the next iteration.
             # Drop the just-completed provider response and last tool locals
             # before that summary/model call so the context swap is also a real

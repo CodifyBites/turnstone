@@ -553,6 +553,15 @@ written stay on the chip and in the audit rows. The advisory carries:
   per finding;
 - the redaction notice when credentials were redacted.
 
+All of a step's advisories follow its last tool result, because a turn's
+results must stay together on the wire. When a step returned several, each
+advisory names its own result by position and tool, as in `Output guard
+(result 1 of 3, read_file): ...`, and a result the guard did not flag gets no
+entry: no advisory is never a clearance. Text the framework wrote itself is not
+guarded at all: a denial, which quotes the approver's feedback, an
+unknown-tool or agent-mode gate error, and the header `read_file` puts before
+an image.
+
 The judge's flags count only when its own verdict is above "none", and the
 model is **never** told the judge cleared a finding — a judge fooled into
 "none" must not get to talk the model out of caution.

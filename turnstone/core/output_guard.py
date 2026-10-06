@@ -18,7 +18,6 @@ tune via ``judge.output_guard_budget_seconds``.  Dependencies: stdlib only.
 from __future__ import annotations
 
 import re
-import secrets
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -280,6 +279,21 @@ def _add_flag(flags: list[str], flag: str) -> None:
 
 
 # -- Data structures --------------------------------------------------------
+
+
+class ControllerText(str):
+    """Tool-result text the framework wrote itself, which the output guard skips.
+
+    A denial (quoting the approver's own feedback), a cancellation notice, an
+    agent-mode gate error, the header ``read_file`` puts before an image: none
+    of it came from a tool, so there is nothing for the guard to defend
+    against, and an advisory calling the approver's correction an injection
+    would turn operator authority against the user.  The mark lives on the
+    string, so string operations drop it: text rebuilt on its way to the guard
+    is guarded as before.
+    """
+
+    __slots__ = ()
 
 
 @dataclass(frozen=True)
@@ -1057,32 +1071,27 @@ def _check_marker_forgery(
     trusted nonces are checked (operator, sender-label) since they are
     independent per-session tokens.  Two severities:
 
-    * **leak (HIGH)** — a marker carries one of this session's exact trusted
-      nonces.  The token only lives in the (cached) system prefix and the
-      folded/labelled blocks, so its appearance in tool output means it has
-      leaked and is being replayed to forge an operator instruction or a
-      sender attribution.  The caller's own host-escaping neutralises it on
-      the wire, but the *appearance itself* is the alarm worth raising.
-    * **forgery (LOW)** — any other fence marker (bare, or a wrong/guessed
-      nonce).  Already inert under the trust declarations; surfaced for the
-      operator's awareness, low to avoid noise on benign content (docs and this
-      project's own source legitimately contain the literals).
+    * **leak (HIGH)** — the output carries one of this session's trusted
+      tokens, in a marker or anywhere else, matched as the wire pass matches it
+      (:func:`turnstone.core.fence.contains_token`: past case, invisible
+      characters and compatibility forms).  The token only lives in the
+      (cached) system prefix and the folded/labelled blocks, so its appearance
+      in tool output means it has leaked and may be replayed to forge an
+      operator instruction or a sender attribution, whatever marker spelling
+      surrounds it.  The wire pass removes it from untrusted text, but the
+      *appearance itself* is the alarm worth raising.
+    * **forgery (LOW)** — any fence marker without a session token (bare, or
+      a wrong/guessed nonce).  Already inert under the trust declarations;
+      surfaced for the operator's awareness, low to avoid noise on benign
+      content (docs and this project's own source legitimately contain the
+      literals).
     """
-    if "[" not in text:
-        return "none"
-    wants = [f"_{n}" for n in (trusted_nonce, trusted_sender_label_nonce) if n]
-    leaked = False
-    forged = False
-    for m in _RE_FENCE_MARKER.finditer(text):
-        suffix = (m.group(1) or "").lower()
-        # Constant-time vs each session nonce (project standard for nonce
-        # comparison).  Bytes form so a non-ASCII forged suffix can't raise.
-        if any(
-            secrets.compare_digest(suffix.encode("utf-8"), want.encode("utf-8")) for want in wants
-        ):
-            leaked = True
-        else:
-            forged = True
+    leaked = any(
+        fence.contains_token(text, nonce)
+        for nonce in (trusted_nonce, trusted_sender_label_nonce)
+        if nonce
+    )
+    forged = "[" in text and _RE_FENCE_MARKER.search(text) is not None
     if leaked:
         _add_flag(flags, "prompt_injection")
         _add_flag(flags, "operator_marker_leak")
