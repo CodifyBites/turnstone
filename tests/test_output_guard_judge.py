@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
 from tests._session_helpers import as_stream
@@ -21,6 +21,9 @@ from turnstone.core.output_guard_judge import (
     _extract_json,
 )
 from turnstone.core.providers._protocol import ModelCapabilities, UsageInfo
+
+if TYPE_CHECKING:
+    import pytest
 
 
 class _VersionedConfigStore:
@@ -545,6 +548,7 @@ class TestAliasResolution:
         alias_client = MagicMock(base_url="http://alias", api_key="alias-key")
         alias_provider = MagicMock()
         alias_provider.provider_name = "anthropic"
+        alias_provider.get_capabilities.return_value = ModelCapabilities(context_window=200_000)
         registry.resolve_binding.return_value = (
             alias_client,
             "claude-haiku-4-5",
@@ -997,6 +1001,19 @@ class TestExtractJson:
     def test_markdown_fence(self) -> None:
         assert _extract_json('Pre\n```json\n{"a": 1}\n```\nPost') == {"a": 1}
 
+    def test_verdict_fenced_after_a_code_fence(self) -> None:
+        """A first fence that does not open on ``{`` is passed over, as the
+        lazy pattern this search replaced passed it over."""
+        reply = 'See ```python\nx = 1\n``` then\n```json\n{"risk_level": "none"}\n```'
+        assert _extract_json(reply) == {"risk_level": "none"}
+
+    def test_unclosed_fence_openers_parse_in_linear_time(self) -> None:
+        """64,000 characters of openers with no closing fence: the lazy pattern
+        took seconds here, rescanning from every opener."""
+        started = time.monotonic()
+        assert _extract_json("```{" * 16_000) is None
+        assert time.monotonic() - started < 1.0
+
     def test_first_brace_pair(self) -> None:
         assert _extract_json('prefix {"a": 1} suffix') == {"a": 1}
 
@@ -1181,3 +1198,155 @@ class TestUsageAccounting:
 
         assert v.succeeded
         assert v.risk_level == "low"
+
+
+class TestOutputBudget:
+    """The output cap is the guard model's own, fitted to the window the prompt leaves."""
+
+    @staticmethod
+    def _judge(
+        *,
+        cfg: ModelConfig | None = None,
+        store: _VersionedConfigStore | None = None,
+        max_output: int = 64_000,
+        window: int = 200_000,
+    ) -> tuple[OutputGuardJudge, ResolvedModelBinding, dict[str, Any]]:
+        provider = _make_provider('{"risk_level": "none", "flags": [], "reasoning": ""}')
+        sent: dict[str, Any] = {}
+        respond = provider.create_streaming
+
+        def capture(**kwargs: Any) -> Any:
+            sent.update(kwargs)
+            return respond(**kwargs)
+
+        provider.create_streaming = capture
+        caps = ModelCapabilities(context_window=window, max_output_tokens=max_output)
+        client = MagicMock(base_url="http://session", api_key="s")
+        binding = _binding(provider, client, "session-model", capabilities=caps, config=cfg)
+        judge = OutputGuardJudge(JudgeConfig(output_guard_llm=True), binding, config_store=store)
+        judge._create_client = lambda: client  # type: ignore[method-assign]
+        return judge, binding, sent
+
+    @staticmethod
+    def _store(max_tokens: int | None) -> _VersionedConfigStore:
+        store = _VersionedConfigStore(temperature=0.1, reasoning_effort="low")
+        if max_tokens is not None:
+            store._values["model.max_tokens"] = max_tokens
+        return store
+
+    def test_alias_max_tokens_sets_the_cap(self) -> None:
+        cfg = ModelConfig("guard", "http://g", "g", "session-model", max_tokens=3000)
+        judge, _binding_, sent = self._judge(cfg=cfg, store=self._store(9000))
+        assert judge.evaluate("payload", call_id="c1").succeeded
+        assert sent["max_tokens"] == 3000
+
+    def test_setting_applies_when_the_alias_sets_none(self) -> None:
+        cfg = ModelConfig("guard", "http://g", "g", "session-model")
+        judge, _binding_, sent = self._judge(cfg=cfg, store=self._store(9000))
+        judge.evaluate("payload", call_id="c1")
+        assert sent["max_tokens"] == 9000
+
+    def test_model_limit_applies_without_a_setting_and_bounds_the_others(self) -> None:
+        judge, _binding_, sent = self._judge(max_output=8000)
+        judge.evaluate("payload", call_id="c1")
+        assert sent["max_tokens"] == 8000
+
+        cfg = ModelConfig("guard", "http://g", "g", "session-model", max_tokens=100_000)
+        judge, _binding_, sent = self._judge(cfg=cfg, max_output=8000)
+        judge.evaluate("payload", call_id="c1")
+        assert sent["max_tokens"] == 8000
+
+    def test_cap_fits_the_window_the_prompt_leaves(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from turnstone.core.output_guard_judge import _ESTIMATE_UNDERCOUNT, _estimate_tokens
+
+        # The fence nonce is random hex, and digits count in the estimate.
+        monkeypatch.setattr(fence, "mint_nonce", lambda: "0123456789abcdef")
+        output = "x" * 4000
+        judge, _binding_, sent = self._judge(window=12_000)
+        judge.evaluate(output, call_id="c1", func_name="bash")
+        prompt = _estimate_tokens(_SYSTEM_PROMPT) + _estimate_tokens(
+            OutputGuardJudge._user_prompt(output, func_name="bash")
+        )
+        assert sent["max_tokens"] == int(12_000 * 0.95) - int(prompt * _ESTIMATE_UNDERCOUNT)
+
+    def test_digits_count_a_token_each(self) -> None:
+        from turnstone.core.output_guard_judge import _estimate_tokens
+
+        assert _estimate_tokens("0123456789") == 10
+        assert _estimate_tokens("abcdefg") == 2  # 7 characters at 3.5 per token
+        assert _estimate_tokens("ab12") == 2
+
+    def test_numeric_output_too_large_by_digits_skips_the_call(self) -> None:
+        """Counted by characters alone this output fits the window; counted a
+        token per digit it does not, so the judge skips with a labelled error
+        rather than sending a request the server would refuse."""
+        output = "7" * 3000
+        judge, _binding_, sent = self._judge(window=4500)
+        verdict = judge.evaluate(output, call_id="c1", func_name="bash")
+        assert "output_too_large_for_judge_window" in verdict.error
+        assert "up to ~" in verdict.error
+        assert not sent
+        assert (len(_SYSTEM_PROMPT) + len(output)) / 3.5 < 4500 * 0.9
+
+    def test_manual_thinking_guard_thinks_within_the_cap(self) -> None:
+        """With an effort resolved, a guard on a model that takes a fixed thinking
+        budget now thinks (the 512 cap left no room), at temperature 1.0 whatever
+        the alias sets; without one it does not think and keeps the alias's
+        temperature."""
+        from turnstone.core.model_turn import resolve_lane
+        from turnstone.core.providers import create_provider
+
+        class _RecordedError(Exception):
+            pass
+
+        def send(effort: str | None) -> dict[str, Any]:
+            sent: dict[str, Any] = {}
+
+            def stream(**kwargs: Any) -> Any:
+                sent.update(kwargs)
+                raise _RecordedError
+
+            client = MagicMock(base_url="https://api.example.com", api_key="k")
+            client.messages.stream = stream
+            cfg = ModelConfig(
+                "guard",
+                "https://api.example.com",
+                "k",
+                "claude-haiku-4-5",
+                max_tokens=8000,
+                reasoning_effort=effort,
+                temperature=0.1,
+            )
+            lane = resolve_lane(
+                create_provider("anthropic"), client, "claude-haiku-4-5", alias="guard", cfg=cfg
+            )
+            binding = ResolvedModelBinding(lane=lane, config=cfg, registry_generation=0)
+            judge = OutputGuardJudge(JudgeConfig(output_guard_llm=True), binding)
+            judge._create_client = lambda: client  # type: ignore[method-assign]
+            assert judge.evaluate("hello", call_id="c1", func_name="web_fetch").error
+            judge.close()
+            return sent
+
+        thinking = send("low")
+        assert thinking["max_tokens"] == 8000
+        assert thinking["thinking"]["type"] == "enabled"
+        assert 0 < thinking["thinking"]["budget_tokens"] < thinking["max_tokens"]
+        assert thinking["extra_body"]["temperature"] == 1.0
+
+        plain = send(None)
+        assert plain["max_tokens"] == 8000
+        assert plain.get("thinking") is None
+        assert plain["extra_body"]["temperature"] == 0.1
+
+    def test_setting_change_retires_the_judge(self) -> None:
+        """``model.max_tokens`` is not part of the lane, yet a change to it
+        must not leave the guard on a stale cap."""
+        store = self._store(9000)
+        cfg = ModelConfig("guard", "http://g", "g", "session-model")
+        judge, binding, _sent = self._judge(cfg=cfg, store=store)
+        config = JudgeConfig(output_guard_llm=True)
+        assert judge.binding_is_current(binding, config)
+
+        store._values["model.max_tokens"] = 12_000
+        store.version += 1
+        assert not judge.binding_is_current(binding, config)

@@ -395,6 +395,21 @@ def resolve_effort_setting(
     return effort or None
 
 
+def resolve_max_tokens_setting(cfg: Any | None, config_store: Any | None) -> int | None:
+    """The operator rungs of the output-cap assignment scheme.
+
+    ``ModelConfig.max_tokens`` (the alias's per-model value) → stored global
+    ``model.max_tokens`` → ``None``.  Unlike the sampling keys, the setting's
+    registered default is a number, so with a store this resolves to a number
+    even when no operator spoke.  A broken store degrades the rung to unset.
+    Callers bound the result by the model's advertised maximum output.
+    """
+    max_tokens = getattr(cfg, "max_tokens", None) if cfg is not None else None
+    if max_tokens is None and config_store is not None:
+        max_tokens = _store_get_or_none(config_store, "model.max_tokens")
+    return max_tokens
+
+
 def resolve_replay_reasoning_to_model(
     registry: ModelRegistry | None,
     alias: str,

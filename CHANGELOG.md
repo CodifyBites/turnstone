@@ -191,6 +191,20 @@ frozen.
 
 ### Fixed
 
+- **The output-guard judge gets its model's output budget (#1291).** The LLM stage capped every
+  verdict at 512 tokens, and the cap counts reasoning as well as the answer, so a thinking model
+  could spend it before writing the verdict; the verdict was then dropped and only the regex stage
+  stood. The cap is now the guard model's own: the alias's `max_tokens`, else the
+  `model.max_tokens` setting (32,768 by default), never above the model's advertised maximum
+  output, and fitted to the context window the prompt leaves. A change to `model.max_tokens`
+  reaches the judge without a restart. To size its prompt against the window, the judge now counts
+  each digit as a token, then allows for up to 1.4 times that count: numeric output such as JSON,
+  CSV or logs ran up to 3.5 times the old character estimate, and a server such as vLLM refuses a
+  request whose prompt and cap together exceed the window. With an effort resolved for the guard,
+  a model that takes a fixed thinking budget, as some of Anthropic's do, now thinks on every
+  judged result, at temperature 1.0; the 512 cap left it no room to. A judged result can now use up to the cap
+  and take up to `judge.output_guard_llm_timeout`; a smaller `max_tokens` or a lower effort on the
+  guard's alias bounds both.
 - **A failed request no longer strands a web search (Anthropic).** When the model called web
   search alongside another tool, the API held the search back until the next request. If that
   request failed (an exhausted credit balance, say) and a new message followed, every later request

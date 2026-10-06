@@ -485,6 +485,31 @@ judge.redact_secrets = true  # auto-redact detected credentials (default)
 
 Configure both at runtime through the admin Judge settings.
 
+The LLM stage (`judge.output_guard_llm`, off by default) runs the model named
+by `judge.output_guard_model`, or the session's model when that is empty. Its
+output cap is that model's own `max_tokens`: the alias's value, else the
+`model.max_tokens` setting (32,768 unless changed), never above the model's
+advertised maximum output. The cap is fitted to the context window the prompt
+leaves, because a server such as vLLM refuses a request whose prompt and cap
+together exceed the window. The prompt is counted generously for that: each
+digit as a token and other text at 3.5 characters per token, then up to 1.4
+times that, the most the count ran short against four tokenizers. A prompt
+that would fill more than 90% of the window when counted that way skips the
+LLM stage with a labelled `llm_error` row. The cap counts the model's
+reasoning as well as its verdict, so a thinking model that spends all of it
+also yields a labelled `llm_error` row, and the heuristic stage stands.
+
+The judge samples at the effort its alias resolves: the alias's own, else
+`model.reasoning_effort`. On a model that takes a fixed thinking budget, as
+some of Anthropic's do, a resolved effort turns thinking on for every judged
+result, and the request then carries temperature 1.0, which thinking requires,
+whatever the alias sets. The judge reads untrusted output, so that output can
+push each verdict toward the cap, and each judged result can take up to
+`judge.output_guard_llm_timeout`. The main loop judges up to four results of a
+batch at once; a task agent judges its results one at a time. To bound the
+cost and the wait, set the guard alias's effort (or `none`) and a smaller
+`max_tokens`.
+
 ### Merge semantics (heuristic + LLM judge)
 
 The chip is a **merge** of the two detectors (issue #560, "show, annotated"),

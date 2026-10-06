@@ -70,6 +70,7 @@ from turnstone.core.model_turn import (
     ResolvedModelBinding,
     model_turn,
     require_lane_capabilities,
+    resolve_max_tokens_setting,
     resolve_model_binding,
 )
 from turnstone.core.trajectory import Turn
@@ -84,11 +85,50 @@ log = get_logger(__name__)
 
 # Prompt-size guard.  A tool output large enough to overflow the judge model's
 # context window would come back as an opaque provider 400 and fall silently to
-# heuristic-only; we detect it up front instead (see ``evaluate``).  The token
-# estimate, window floor, and coercion are shared with the intent judge
-# (imported above) so the two stay in lockstep.  ``0.9`` leaves headroom for
-# the 512-token response plus estimation error.
+# heuristic-only; we detect it up front instead (see ``evaluate``).  The window
+# floor and coercion are shared with the intent judge (imported above); the
+# token estimate is this judge's own (``_estimate_tokens``).  Measured against
+# four tokenizers on code, logs, CSV, JSON and padded output, real counts ran
+# up to ``_ESTIMATE_UNDERCOUNT`` times that estimate, and every size decision
+# counts the prompt at that worst case.  A prompt is sent when it then fills at
+# most ``_MAX_PROMPT_RATIO`` of the window.  The answer's cap is fitted to the
+# window the prompt leaves, less ``_ESTIMATE_MARGIN_RATIO`` of it: a server such
+# as vLLM refuses any request whose prompt and cap together exceed the window.
 _MAX_PROMPT_RATIO = 0.9
+_ESTIMATE_MARGIN_RATIO = 0.05
+_ESTIMATE_UNDERCOUNT = 1.4
+
+
+def _estimate_tokens(text: str) -> int:
+    """Estimate *text*'s tokens: one per digit, ``_CHARS_PER_TOKEN`` characters per token otherwise.
+
+    Tokenizers that split numbers spend a token on every digit, so counting
+    characters alone undercounts numeric output: up to 3.5 times on CSV, JSON
+    and logs in the measurements behind ``_ESTIMATE_UNDERCOUNT``.
+    """
+    digits = sum(map(str.isdigit, text))
+    return int(digits + (len(text) - digits) / _CHARS_PER_TOKEN)
+
+
+def _resolve_output_budget(binding: ResolvedModelBinding, config_store: Any | None) -> int:
+    """The judge's output cap: the guard model's own ``max_tokens`` setting.
+
+    The cap counts the guard model's reasoning as well as its verdict, so no
+    fixed figure suits every model: it cuts a thinking model off mid-thought
+    and is arbitrary for one that does not think.  It follows the guard
+    model's own setting instead (:func:`resolve_max_tokens_setting`): the
+    alias's ``max_tokens``, else the ``model.max_tokens`` setting, whose
+    registered default (32768) applies whenever a settings store is present.
+    The model's advertised maximum output bounds the result, and is the
+    budget only when neither rung gives one, which happens without a store.
+    The operator bounds the thinking itself with the effort setting on the
+    guard's alias.
+    """
+    ceiling = require_lane_capabilities(binding.lane).max_output_tokens
+    budget = resolve_max_tokens_setting(binding.config, config_store)
+    if not isinstance(budget, int) or budget <= 0:
+        budget = ceiling
+    return max(1, min(budget, ceiling) if ceiling > 0 else budget)
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +236,10 @@ _SYSTEM_PROMPT = (
 )
 
 
+_RE_FENCE_OPENER = re.compile(r"```(?:json)?\s*\{")
+_RE_FENCE_CLOSER = re.compile(r"\}\s*```")
+
+
 def _extract_json(text: str) -> dict[str, Any] | None:
     """Extract a JSON object from text using three fallback strategies.
 
@@ -224,11 +268,16 @@ def _extract_json(text: str) -> dict[str, Any] | None:
     except (json.JSONDecodeError, ValueError):
         pass  # expected when the LLM prefixed prose or wrapped in a fence; fall through
 
-    # Strategy 2: markdown code block
-    md_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if md_match:
+    # Strategy 2: markdown code block.  Two linear searches find the match of
+    # the lazy pattern r"```(?:json)?\s*(\{.*?\})\s*```": the first opening
+    # fence whose body starts with "{", then the first "}" closing a fence
+    # after that brace.  The lazy pattern rescanned the rest of the reply from
+    # every unclosed opener, quadratic in a reply the judge's reading can steer.
+    opener = _RE_FENCE_OPENER.search(text)
+    closer = _RE_FENCE_CLOSER.search(text, opener.end()) if opener else None
+    if opener and closer:
         try:
-            data = json.loads(md_match.group(1))
+            data = json.loads(text[opener.end() - 1 : closer.start() + 1])
             if isinstance(data, dict):
                 return data
         except (json.JSONDecodeError, ValueError):
@@ -378,6 +427,7 @@ class OutputGuardJudge:
             getattr(binding.config, "context_window", None),
             session_window,
         )
+        self._output_budget = _resolve_output_budget(binding, config_store)
         if not resolved:
             # AUDIT label keeps its pre-#827 fallback semantics: "" here so
             # recorded verdicts show ``judge_model = self._model`` (the raw
@@ -418,9 +468,16 @@ class OutputGuardJudge:
         """
         if self._fingerprint_config(config) != self._config_fingerprint:
             return False
-        return self._binding_state.is_current(
+        if not self._binding_state.is_current(
             session_binding,
             requested_alias=str(config.output_guard_model or "").strip(),
+        ):
+            return False
+        # ``model.max_tokens`` is not part of the lane, so a change to it alone
+        # leaves the binding current; the output cap it feeds must not go stale.
+        return (
+            _resolve_output_budget(self._binding_state.binding, self._binding_state.config_store)
+            == self._output_budget
         )
 
     # -- Client lifecycle helpers ------------------------------------------
@@ -636,23 +693,28 @@ class OutputGuardJudge:
         # warning, and return a LABELLED error verdict so the skip surfaces as a
         # distinct ``llm_error`` audit row (reason = "output_too_large…") the
         # operator can see, rather than a silent no-op.
-        prompt_chars = sum(len(t.text) for t in judge_turns)
-        est_tokens = int(prompt_chars / _CHARS_PER_TOKEN)
-        if est_tokens > self._judge_context_window * _MAX_PROMPT_RATIO:
+        prompt_tokens = int(
+            sum(_estimate_tokens(t.text) for t in judge_turns) * _ESTIMATE_UNDERCOUNT
+        )
+        if prompt_tokens > self._judge_context_window * _MAX_PROMPT_RATIO:
             log.warning(
                 "output_guard_judge.output_too_large",
                 call_id=call_id,
                 func_name=func_name,
                 output_chars=len(output),
-                est_prompt_tokens=est_tokens,
+                est_prompt_tokens=prompt_tokens,
                 judge_context_window=self._judge_context_window,
             )
+            # A built prompt's count includes the undercount allowance; the
+            # early exit's is the least the output alone can count.
+            size = f"up to ~{prompt_tokens}" if judge_turns else f"at least ~{prompt_tokens}"
             return self._error_verdict(
                 verdict_id,
                 call_id,
                 start,
-                f"output_too_large_for_judge_window: ~{est_tokens} tok "
-                f"> {self._judge_context_window} window",
+                f"output_too_large_for_judge_window: {size} tok "
+                f"> {int(self._judge_context_window * _MAX_PROMPT_RATIO)} of a "
+                f"{self._judge_context_window} window",
             )
 
         try:
@@ -682,10 +744,12 @@ class OutputGuardJudge:
         # the guard model's full assignment scheme, effort included: a
         # code-chosen effort is an unvetted token on local vocabularies
         # and can flip template thinking toggles the operator never
-        # engaged.  On a thinking model whose effort the operator leaves
-        # unbounded, a pass that consumes the whole 512-token cap parses
-        # to a labelled llm_error verdict (heuristic tier stands) — the
-        # remediation is an effort value on the guard's model alias.
+        # engaged.  The output cap is the guard model's own
+        # (``_resolve_output_budget``), fitted to the window the prompt
+        # leaves; it counts reasoning too, so a pass that thinks through
+        # all of it parses to a labelled llm_error verdict (heuristic tier
+        # stands) — the remediation is an effort or max_tokens value on the
+        # guard's model alias.
         # The abort wiring closes the abandoned worker's HTTP stream on the
         # timeout/cancel paths so the daemon thread exits promptly instead
         # of blocking on the read until the upstream's next chunk.
@@ -706,6 +770,10 @@ class OutputGuardJudge:
             self._end_evaluation()
 
         handoff = _UsageHandoff(self._record_usage, model=self._model, source="output_guard")
+        max_tokens = min(
+            self._output_budget,
+            int(self._judge_context_window * (1 - _ESTIMATE_MARGIN_RATIO)) - prompt_tokens,
+        )
 
         def _run_model_turn(ref: Any) -> Any:
             try:
@@ -713,7 +781,7 @@ class OutputGuardJudge:
                     lane,
                     judge_turns,
                     tools=None,
-                    max_tokens=512,
+                    max_tokens=max_tokens,
                     product_recovery=True,
                     admit_reissue=admit_reissue,
                     on_completed=handoff.capture,
