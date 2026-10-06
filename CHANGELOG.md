@@ -43,6 +43,24 @@ frozen.
 
 ### Added
 
+- **Output-guard evals in `turnstone-eval` (#1291).** `--output-guard judge` scores the LLM stage on
+  tool outputs with directives planted at known lines: detection, false positives, whether its flags
+  stay inside the fixed vocabulary, citation precision and recall, and failed verdicts.
+  `--output-guard locate` checks that a model finds the lines an advisory cites, alone and as the
+  first of two results, and `--output-guard subagent` whether production's task agent acts on a
+  planted directive with and without the advisory, counting only calls that carry it out (a command
+  by the program it runs, a write by its path, a fetch by its URL), retrying a run that fails before
+  it acts and keeping the error of one that fails after. Each subagent run keeps the agent's
+  transcript, with the reasoning its provider returned, and `--output-guard grade` reads those
+  transcripts back to a grader model: whether the agent noticed the planted instruction, what it did
+  about it, whether it mentioned the guard's warning, and how it read the instruction, so a paid run
+  is graded without being repeated. `--judge-model` runs the guard's judge on a model of its own,
+  selected through `judge.output_guard_model`. `--provider` reaches the endpoint through the named
+  adapter, so a model that takes mid-conversation system messages receives the advisory as one; a
+  hosted provider reaches its own API and reads its own key variable. Cases ship in
+  `turnstone/eval/scenarios/output_guard.py`. The mode flags `--nudges`, `--skill-adherence` and
+  `--output-guard` are now mutually exclusive; given together, one ran and the other was silently
+  dropped.
 - **One live owner per workstream.** A process that loads a workstream holds a time-bounded owner
   lease on it, renewed every 10 seconds and judged against the database clock, and every write the
   session makes presents the lease's fencing epoch. Two servers sharing PostgreSQL can no longer

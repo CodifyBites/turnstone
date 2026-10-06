@@ -287,6 +287,7 @@ from turnstone.core.tools import (
     TOOLS,
     apply_cwd_context,
     merge_mcp_tools,
+    salvage_tool_arguments,
 )
 from turnstone.core.trajectory import (
     PROVENANCE_META_KEY,
@@ -19186,48 +19187,7 @@ class ChatSession:
         try:
             args = json.loads(raw_args)
         except json.JSONDecodeError as exc:
-            args = None
-            # Fallback 1: regex-extract a known key from malformed JSON.
-            # Keep this list focused on primary/identifying keys — the
-            # model will see the salvaged minimal-args result and
-            # resubmit with correct JSON on the next turn.  Coordinator
-            # keys (ws_id, message, initial_message, parent_ws_id) are
-            # included so malformed coordinator tool calls aren't a
-            # dead-end.
-            for key in (
-                "action",
-                "command",
-                "code",
-                "content",
-                "initial_message",
-                "message",
-                "name",
-                "page",
-                "parent_ws_id",
-                "path",
-                "pattern",
-                "prompt",
-                "query",
-                "status",
-                "task_id",
-                "title",
-                "uri",
-                "url",
-                "ws_id",
-            ):
-                m = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', raw_args)
-                if m:
-                    try:
-                        val = json.loads('"' + m.group(1) + '"')
-                    except (json.JSONDecodeError, Exception):
-                        val = m.group(1)
-                    args = {key: val}
-                    break
-            # Fallback 2: bare string (no JSON wrapper at all)
-            if args is None and raw_args.strip() and not raw_args.strip().startswith("{"):
-                pk = PRIMARY_KEY_MAP.get(func_name)
-                if pk:
-                    args = {pk: raw_args}
+            args = salvage_tool_arguments(func_name, raw_args)
             if args is None:
                 preview = raw_args[:4000] + ("..." if len(raw_args) > 4000 else "")
                 # Surface to user so they can see what the model produced
@@ -26354,11 +26314,14 @@ class ChatSession:
             _maybe_compact_agent_context()
             result = _api_call_with_compaction()
 
-            # Handle truncation or content filter — stop agent early
+            # Handle truncation or content filter — stop agent early.  The turn
+            # still joins the trajectory, as every assistant turn does.
             if result.finish_reason == "length":
+                agent_turns.append(result.turn)
                 self.ui.on_info(f"[{label}] response truncated, stopping early")
                 return _finish_synthesis(_non_blank_or(result.content, "(truncated)"))
             if result.finish_reason == "content_filter":
+                agent_turns.append(result.turn)
                 self.ui.on_info(f"[{label}] blocked by content filter")
                 cancel_scope.check()
                 return "(content filter)"
@@ -26709,6 +26672,7 @@ class ChatSession:
         agent_turns.append(synthesis_turn)
         context_turns.append(synthesis_turn)
         result = _api_call_with_compaction(_tools=[])
+        agent_turns.append(result.turn)
         cancel_scope.check()
         fallback = {
             "length": "(truncated)",
