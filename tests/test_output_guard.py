@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from turnstone.core.output_guard import (
     JUDGE_FALLBACK_SYMBOL,
     JUDGE_SYMBOLS,
+    MAX_CITED_RANGES,
     MAX_JUDGE_SYMBOLS,
     evaluate_output,
     judge_symbol,
     merge_guard_display_payload,
     project_model_finding,
     redact_credentials,
+    surviving_line_ranges,
 )
 
 
@@ -1099,3 +1103,70 @@ class TestProjectModelFinding:
         assert len(names) == len(set(names))
         assert JUDGE_FALLBACK_SYMBOL.name not in names
         assert all(symbol.meaning and symbol.advice for symbol in JUDGE_SYMBOLS)
+
+
+class TestCitedLines:
+    """A cited range reaches the model only while it names the same lines."""
+
+    TEXT = "\n".join(f"line {n}" for n in range(1, 11))
+
+    def test_ranges_in_an_unchanged_text_survive_merged_in_order(self) -> None:
+        ranges = ((7, 8), (2, 3), (3, 4), (5, 5), (10, 10))
+        assert surviving_line_ranges(ranges, self.TEXT, self.TEXT) == ((2, 5), (7, 8), (10, 10))
+
+    def test_out_of_range_lines_are_dropped(self) -> None:
+        assert surviving_line_ranges(((9, 11), (11, 11), (0, 1)), self.TEXT, self.TEXT) == ()
+
+    def test_merged_ranges_are_capped(self) -> None:
+        ranges = tuple((n, n) for n in range(1, 11, 2))
+        kept = surviving_line_ranges(ranges, self.TEXT, self.TEXT)
+        assert len(kept) == MAX_CITED_RANGES
+        assert kept == ranges[:MAX_CITED_RANGES]
+
+    def test_head_clip_keeps_ranges_before_the_cut(self) -> None:
+        clipped = self.TEXT[: self.TEXT.index("line 6") + 3] + "... [truncated]"
+        kept = surviving_line_ranges(((1, 2), (4, 5), (5, 6), (8, 9)), self.TEXT, clipped)
+        assert kept == ((1, 2), (4, 5))
+
+    def test_a_cut_that_drops_lines_drops_the_ranges_after_it(self) -> None:
+        lines = self.TEXT.split("\n")
+        recut = "\n".join([*lines[:3], "... [6 lines cut] ...", lines[-1]])
+        kept = surviving_line_ranges(((1, 1), (2, 3), (4, 4), (10, 10)), self.TEXT, recut)
+        assert kept == ((1, 3),)
+
+    def test_a_changed_line_drops_only_the_ranges_that_name_it(self) -> None:
+        changed = self.TEXT.replace("line 4", "line four")
+        kept = surviving_line_ranges(((1, 3), (3, 5), (4, 4), (6, 9)), self.TEXT, changed)
+        assert kept == ((1, 3), (6, 9))
+
+    def test_many_ranges_over_a_long_text_take_one_pass(self) -> None:
+        """The judge chooses how many ranges to cite: thousands of whole-text
+        ranges must not cost thousands of whole-text comparisons."""
+        lines = [f"l{n}" for n in range(50_000)]
+        read = "\n".join(lines)
+        lines[25_000] = "changed"
+        started = time.monotonic()
+        kept = surviving_line_ranges(((1, 50_000),) * 3000 + ((1, 2),), read, "\n".join(lines))
+        assert time.monotonic() - started < 1.0
+        assert kept == ((1, 2),)
+
+    def test_projection_keeps_citations_only_when_the_judge_flagged(self) -> None:
+        flagged = project_model_finding(
+            risk_level="high",
+            heuristic_flags=[],
+            heuristic_annotations=[],
+            sanitized=None,
+            judge_risk="high",
+            judge_flags=("prompt_injection",),
+            cited_lines=((3, 4),),
+        )
+        assert flagged.cited_lines == ((3, 4),)
+        cleared = project_model_finding(
+            risk_level="low",
+            heuristic_flags=["private_ip_disclosure"],
+            heuristic_annotations=["ip"],
+            sanitized=None,
+            judge_risk="none",
+            cited_lines=((3, 4),),
+        )
+        assert cleared.cited_lines == ()

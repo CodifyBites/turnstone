@@ -190,29 +190,37 @@ frozen.
   which a preview shows without its scripts.
 - **The output guard judges on `judge.model` when it has no model of its own (#1291).** With
   `judge.output_guard_model` empty, the guard's LLM stage ran on the session's model, the model
-  whose tool output it judges. It now uses `judge.model`, and the session's model only when that
-  is empty too; a set alias that is not registered is passed over with a warning. Installs that set
+  whose tool output it judges. It now uses `judge.model`, and the session's model only when that is
+  empty too; a set alias that is not registered is passed over with a warning. Installs that set
   `judge.model` but not `judge.output_guard_model` switch the guard's model on upgrade: the guard
   then shares that alias's `max_concurrency` with the intent judge, and long tool output may exceed
   a small judge's context window, which skips the LLM stage for that result. Set
-  `judge.output_guard_model` to keep a separate model for the guard.
+  `judge.output_guard_model` to keep a separate model for the guard. A workstream's own judge model
+  (the launcher's judge picker, the create API's `judge_model`, the CLI's `--judge-model`) is that
+  workstream's `judge.model`, so it runs the guard too unless `judge.output_guard_model` is set.
+  Where the regex stage redacts a credential (`judge.redact_secrets`), the guard's model now reads
+  the redacted text the session's model receives rather than the raw tool output, so a secret the
+  session's model never sees no longer reaches the guard's model, possibly another provider's, or
+  the reasoning it writes into the audit row; the lines it cites are that text's.
 
 ### Fixed
 
 - **The output-guard judge gets its model's output budget (#1291).** The LLM stage capped every
   verdict at 512 tokens, and the cap counts reasoning as well as the answer, so a thinking model
   could spend it before writing the verdict; the verdict was then dropped and only the regex stage
-  stood. The cap is now the guard model's own: the alias's `max_tokens`, else the
-  `model.max_tokens` setting (32,768 by default), never above the model's advertised maximum
-  output, and fitted to the context window the prompt leaves. A change to `model.max_tokens`
-  reaches the judge without a restart. To size its prompt against the window, the judge now counts
-  each digit as a token, then allows for up to 1.4 times that count: numeric output such as JSON,
-  CSV or logs ran up to 3.5 times the old character estimate, and a server such as vLLM refuses a
-  request whose prompt and cap together exceed the window. With an effort resolved for the guard,
-  a model that takes a fixed thinking budget, as some of Anthropic's do, now thinks on every
-  judged result, at temperature 1.0; the 512 cap left it no room to. A judged result can now use up to the cap
-  and take up to `judge.output_guard_llm_timeout`; a smaller `max_tokens` or a lower effort on the
-  guard's alias bounds both.
+  stood. The cap is now the guard model's own: the alias's `max_tokens`, else the `model.max_tokens`
+  setting (32,768 by default), never above the model's advertised maximum output, and fitted to the
+  context window the prompt leaves. A change to `model.max_tokens` reaches the judge without a
+  restart. To size its prompt against the window, the judge now counts each ASCII digit as a token,
+  text outside ASCII by its UTF-8 length and a dense base64-like run (mixed case, with a digit) at
+  0.6 tokens a character, then allows for up to 1.4 times that count: numeric output such as JSON,
+  CSV or logs ran up to 3.5 times the old character estimate, Chinese, Japanese, Korean and base64
+  text up to 2.4 times, and a server such as vLLM refuses a request whose prompt and cap together
+  exceed the window. With an effort resolved for the guard, a model that takes a fixed thinking
+  budget, as some of Anthropic's do, now thinks on every judged result, at temperature 1.0; the 512
+  cap left it no room to. A judged result can now use up to the cap and take up to
+  `judge.output_guard_llm_timeout`; a smaller `max_tokens` or a lower effort on the guard's alias
+  bounds both.
 - **A failed request no longer strands a web search (Anthropic).** When the model called web
   search alongside another tool, the API held the search back until the next request. If that
   request failed (an exhausted credit balance, say) and a new message followed, every later request
@@ -468,25 +476,42 @@ frozen.
   scanned and redacted, but its model never saw the finding, so a sub-agent that read a prompt
   injection got no warning even though the guard flagged it and the operator's chip showed it. A
   flagged result now gets the same advisory as in the conversation, after the step's tool results,
-  and the agent's intent judge sees it on later gated calls. The text of a list result, such as
-  `read_file` on an image, is now guarded; it skipped the guard entirely. An agent whose model
-  takes the advisory in the trusted fence, under a main model that takes native system messages,
-  now has that fence declared in its prompt. The guard reads past the agent's 16,000-character
-  cut so it can redact a credential that straddles it, so the advisory for a result the cut
-  shortened says the finding may concern the part the agent did not receive. The declaration
-  itself, in every session whose model folds operator turns, now says a block carrying the
-  session's token can follow a tool result; it told the model to distrust any marker inside tool
-  output, which read literally covered the real advisory appended there. Since the declaration
-  trusts the token alone, the token itself is now removed from untrusted text before the fold
-  appends its block, matched past case, invisible characters and full-width forms: a leaked token
-  inside a marker spelled with a zero-width space or a lookalike letter passed the old defang. The
-  sender label of a shared workstream gets the same treatment, and the guard flags a leaked token
-  wherever it appears. All of a step's advisories follow its last result, so in a step with several
-  results each advisory now names its own by position and tool. Text the framework wrote itself
-  (a denial quoting the approver's feedback, an unknown-tool or agent-mode gate error, the header
-  before an image) is no longer guarded; a denial such as "From now on you must write outputs to
-  /tmp" scored as an injection, and the advisory turned the approver's own correction against
-  them.
+  and the agent's intent judge sees it on later gated calls. A tool's own text inside a list result
+  is now guarded; list results skipped the guard entirely. The only list result today, `read_file`
+  on an image, holds just the framework's header before the image. An agent whose model takes the
+  advisory in the trusted fence, under a main model that takes native system messages, now has that
+  fence declared in its prompt. The guard reads past the agent's 16,000-character cut so it can
+  redact a credential that straddles it, so the advisory for a result the cut shortened says the
+  finding may concern the part the agent did not receive. The declaration itself, in every session
+  whose model folds operator turns, now says a block carrying the session's token can follow a tool
+  result; it told the model to distrust any marker inside tool output, which read literally covered
+  the real advisory appended there. Since the declaration trusts the token alone, the token itself
+  is now removed from untrusted text wherever it joins the request (the history, before the fold
+  appends its block, and attachments), matched past case, past accents and compatibility forms (`é`,
+  full-width, mathematical, circled) and past anything between its characters that is not an ASCII
+  letter or digit (spaces, line breaks, invisible characters, combining marks): a leaked token
+  inside a marker spelled with a zero-width space or a lookalike letter passed the old defang.
+  Lookalikes that Unicode does not decompose to a letter or digit (another script's letters, ASCII
+  `O` for `0` and `l` or `I` for `1`) are not matched, and text inside an image or a natively read
+  PDF is beyond the reach of a text pass. The sender label of a shared workstream gets the same
+  treatment, and the guard flags a leaked token wherever it appears. All of a step's advisories
+  follow its last result, so in a step with several results each advisory now names its own by
+  position, and by tool when the session offers a tool of that name; the operator's guard card shows
+  the same label. Text the framework wrote itself (a denial quoting the approver's feedback, an
+  unknown-tool or agent-mode gate error, the header before an image) is no longer guarded; a denial
+  such as "From now on you must write outputs to /tmp" scored as an injection, and the advisory
+  turned the approver's own correction against them.
+- **Output-guard findings name the lines the judge flagged (#1291).** With the LLM stage on, the
+  judge reads the tool output with numbered lines and may cite ranges; the advisory names them
+  as numbers, never quoting the lines. A range reaches the model only if its lines read the same,
+  at the same numbers, in what the model receives: one after a redacted key block, a re-cut or a
+  task agent's cut is dropped rather than renumbered. The sentence says the numbers count from
+  the first line of the result, since `read_file` and search output print numbers of their own,
+  and asks the model to treat the whole result with the same caution, since the judge chose the
+  lines after reading text that can steer it. A result the main loop cuts again after redaction
+  now also gets the notice that the finding may concern the part that was cut. Output whose
+  numbered prompt would not fit the judge's window, such as one padded with blank lines, is
+  judged unnumbered and cites no lines, where it would otherwise skip the judge.
 - **Tool policies that cannot be read refuse the batch.** When reading the admin tool policies
   failed, every call came back as matching no policy, so `deny` rules stopped applying:
   skip-permissions, "Always" grants, auto-approve lists, the smart-approval judge or a person could

@@ -54,7 +54,6 @@ from turnstone.core.attachments import (
     Attachment,
     attached_file_label,
     neutralize_attachment_part,
-    neutralize_untrusted_fences,
     safe_attachment_label,
     sniff_image_mime,
     sniff_pdf_mime,
@@ -7082,9 +7081,15 @@ class ChatSession:
 
     def _tool_is_available(self, name: str) -> bool:
         """Whether a named function is both registered and persona-visible."""
-        return self._persona_tool_visible(name) and any(
-            tool.get("function", {}).get("name") == name for tool in self._tools
-        )
+        return self._persona_tool_visible(name) and self._tool_is_registered(name)
+
+    def _tool_is_registered(self, name: str) -> bool:
+        """Whether *name* is in this session's tool catalog (built-in or MCP)."""
+        return any(tool.get("function", {}).get("name") == name for tool in self._tools)
+
+    def _fence_tokens(self) -> tuple[str, str]:
+        """This session's fence tokens, which untrusted text on the wire must never carry."""
+        return (self._envelope_nonce, self._sender_label_nonce)
 
     def _operator_prompt_addition(self, caps: ModelCapabilities) -> str:
         """Trust declaration required when operator turns use nonce fences."""
@@ -8036,7 +8041,7 @@ class ChatSession:
                         cancel_ref=cancel_ref,
                         principal_id=principal_id,
                     )
-                part = neutralize_attachment_part(raw_part)
+                part = neutralize_attachment_part(raw_part, tokens=self._fence_tokens())
                 if cancel_ref is not None and cancel_ref.aborted:
                     raise GenerationCancelled
                 if part is not None:
@@ -8083,6 +8088,7 @@ class ChatSession:
                 cancel_ref=cancel_ref,
                 principal_id=principal_id,
             ),
+            tokens=self._fence_tokens(),
             max_extracted_chars=max_pdf_extracted_chars,
             check_cancelled=check_pdf_cancelled if cancel_ref is not None else None,
         )
@@ -8229,16 +8235,15 @@ class ChatSession:
         )
         if not transcript:
             return None
-        # Transcribed speech is untrusted the same way typed message content is:
-        # defang look-alike sender-label markers so an uploaded audio clip
-        # can't forge attribution (the perception fallback follows the same
-        # attachment-derived-text boundary).
+        # Transcribed speech is untrusted the same way typed message content is.
+        # The resolver's attachment pass (``neutralize_attachment_part``) defangs
+        # trusted markers and removes the session's tokens from this part, as
+        # from every attachment part it returns.
         return {
             "type": "text",
             "text": (
                 f"[Transcript of audio attachment '{safe_attachment_label(name)}' "
-                f"(untrusted)]\n\n"
-                f"{neutralize_untrusted_fences(transcript)}"
+                f"(untrusted)]\n\n{transcript}"
             ),
         }
 
@@ -8406,14 +8411,13 @@ class ChatSession:
             return None
         name = str(att.get("filename") or kind)
         # The perception model's description is untrusted the same way typed
-        # message content is: defang look-alike sender-label markers so a
-        # perceived image/PDF/audio can't forge attribution.
+        # message content is; the resolver's attachment pass cleans it, as it
+        # does the transcript part above.
         return {
             "type": "text",
             "text": (
                 f"[Perception of {kind} attachment '{safe_attachment_label(name)}' "
-                f"(untrusted)]\n\n"
-                f"{neutralize_untrusted_fences(text)}"
+                f"(untrusted)]\n\n{text}"
             ),
         }
 
@@ -13192,6 +13196,12 @@ class ChatSession:
                 # Bail if generation was superseded during tool execution.
                 if self._generation != my_generation:
                     return
+                # Results the framework wrote itself (a denial) pass the guard by
+                # (``ControllerText``).  The repeat warning and admission rebuild
+                # strings, which drops the mark, so note them as they arrive.
+                _controller_ids = {
+                    tc_id for tc_id, output in results if isinstance(output, ControllerText)
+                }
 
                 # Same construction as the duplicate-id gate above; one
                 # comprehension serves both so the two checks can never
@@ -13391,12 +13401,6 @@ class ChatSession:
                         admitted.append((tc_id, output))
                     results = admitted
 
-                # Results the framework wrote itself (a denial) pass the guard by
-                # (``ControllerText``).  Admission rebuilds strings, so note them
-                # first.
-                _controller_ids = {
-                    tc_id for tc_id, output in results if isinstance(output, ControllerText)
-                }
                 _admit_batch(_tc_names, maximum, _admissions)
 
                 # Pre-evaluate the guard stage concurrently when LLM is
@@ -13456,24 +13460,13 @@ class ChatSession:
                                     my_generation=my_generation,
                                 )
                         elif isinstance(output, list):
-                            # Image/structured output — evaluate each text part
-                            # independently so credentials in any part get redacted.
-                            for p in output:
-                                if (
-                                    isinstance(p, dict)
-                                    and p.get("type") == "text"
-                                    and p.get("text")
-                                    and not isinstance(p["text"], ControllerText)
-                                ):
-                                    p["text"], _part_assess = self._evaluate_output(
-                                        tc_id,
-                                        p["text"],
-                                        _tc_names.get(tc_id, ""),
-                                        tool_args=_tc_args.get(tc_id, ""),
-                                        my_generation=my_generation,
-                                    )
-                                    if _part_assess is not None:
-                                        assessment = _part_assess
+                            assessment = self._guard_list_result(
+                                tc_id,
+                                output,
+                                _tc_names.get(tc_id, ""),
+                                tool_args=_tc_args.get(tc_id, ""),
+                                my_generation=my_generation,
+                            )
 
                     # This is the result-fold commit fence.  Everything below
                     # mutates shared session/UI/storage state, so a generation
@@ -13492,7 +13485,9 @@ class ChatSession:
                 # whose text no longer locates the marker exactly once passes
                 # as the guard left it: what the guard produced is what the
                 # model sees, and the pre-send hard-compaction guard remains
-                # the backstop for a batch that grew past its allowance.
+                # the backstop for a batch that grew past its allowance.  The
+                # advisory then checks its citations against the re-cut text and
+                # says the result was cut (``output_guard_advisory``).
                 recut: list[tuple[int, str, Any, OutputAssessment | None]] = []
                 for _ri, tc_id, output, assessment in guarded_results:
                     rendered = _admissions.get(tc_id)
@@ -13540,7 +13535,7 @@ class ChatSession:
                         result_advisories = self._collect_advisories(
                             assessment,
                             tc_names.get(tc_id, ""),
-                            _ri == last_idx,
+                            received=output,
                             result_index=_ri + 1,
                             result_count=last_idx + 1,
                         )
@@ -13711,6 +13706,10 @@ class ChatSession:
                     allow_cancelled=False,
                 ):
                     raise GenerationCancelled()
+                # The committed results and their assessments, which hold the
+                # text the guard returned, must not outlive the fold into the
+                # next model request.
+                del fold_tool_batch, guarded_results, recut, _batch_guard
 
                 # Stop may land immediately after the result-fold transaction.
                 # Reject both cooperative Stop and force supersession before a
@@ -17462,6 +17461,7 @@ class ChatSession:
             evaluate_output,
             merge_guard_display_payload,
             project_model_finding,
+            surviving_line_ranges,
         )
 
         judge_principal = principal_id
@@ -17487,6 +17487,17 @@ class ChatSession:
             trusted_sender_label_nonce=self._sender_label_nonce,
         )
         _check_owner()
+        wants_redaction = heuristic.sanitized is not None and jc is not None and jc.redact_secrets
+        if not wants_redaction:
+            # ``sanitized`` means "redaction was applied" to every consumer
+            # below (the judge, audit rows, the acted assessment, the returned
+            # text), so a redacted copy the configuration declines is dropped
+            # here, at the one producer, rather than gated at each consumer.
+            heuristic = dataclasses.replace(heuristic, sanitized=None)
+        # The judge reads what the model will: the redacted text when redaction
+        # applies, so a secret the model never sees does not reach the guard's
+        # model, possibly another provider's, nor its reasoning in the audit row.
+        judged = heuristic.sanitized if heuristic.sanitized is not None else output
 
         # Stage 2: LLM judge (opt-in, capability-gated).  The rate limiter
         # bounds adversarial fan-out cost (60 calls/min/session).  The
@@ -17515,7 +17526,7 @@ class ChatSession:
         llm_verdict = (
             self._invoke_output_guard_judge(
                 call_id,
-                output,
+                judged,
                 func_name,
                 tool_description=tool_description,
                 tool_args=tool_args,
@@ -17547,13 +17558,6 @@ class ChatSession:
         # disable / rate-limit / error / timeout) — lets the type checker
         # follow attribute access below without re-asserting succeeded.
         llm = llm_verdict if (llm_verdict is not None and llm_verdict.succeeded) else None
-        wants_redaction = heuristic.sanitized is not None and jc is not None and jc.redact_secrets
-        if not wants_redaction:
-            # ``sanitized`` means "redaction was applied" to every consumer
-            # below (audit rows, the acted assessment, the returned text), so
-            # a redacted copy the configuration declines is dropped here, at
-            # the one producer, rather than gated at each consumer.
-            heuristic = dataclasses.replace(heuristic, sanitized=None)
 
         # Persistence — one row per (call_id, tier).  Heuristic row when it
         # has signal; the LLM row carries the judge's OWN verdict on success
@@ -17668,16 +17672,25 @@ class ChatSession:
         # and flags after reading attacker-controlled output, and the advisory
         # carries operator-level trust.  So the model gets the heuristic's
         # findings as they are plus the judge's flags mapped onto fixed
-        # symbols; the chip payload above keeps the judge's own words for the
-        # operator.  Risk is the merged level, so the advisory and the chip
-        # agree on it, and a judge fooled into "none" lowers nothing.
-        acted = project_model_finding(
-            risk_level=str(d["risk_level"]),
-            heuristic_flags=heuristic.flags,
-            heuristic_annotations=heuristic.annotations,
-            sanitized=heuristic.sanitized,
-            judge_risk=llm.risk_level if llm else "none",
-            judge_flags=llm.flags if llm else (),
+        # symbols, and the lines it cited in the text it read, which is the
+        # text the model receives; the chip payload above keeps the judge's own
+        # words for the operator.  Risk is the merged level, so the advisory and
+        # the chip agree on it, and a judge fooled into "none" lowers nothing.
+        acted = dataclasses.replace(
+            project_model_finding(
+                risk_level=str(d["risk_level"]),
+                heuristic_flags=heuristic.flags,
+                heuristic_annotations=heuristic.annotations,
+                sanitized=heuristic.sanitized,
+                judge_risk=llm.risk_level if llm else "none",
+                judge_flags=llm.flags if llm else (),
+                # One text on both sides: this only bounds, merges and caps
+                # the ranges the judge cited.
+                cited_lines=(
+                    surviving_line_ranges(llm.lines, judged, judged) if llm is not None else ()
+                ),
+            ),
+            returned_text=judged,
         )
 
         d["func_name"] = func_name
@@ -17706,11 +17719,48 @@ class ChatSession:
         ):
             raise GenerationCancelled()
 
-        if wants_redaction:
-            sanitized = heuristic.sanitized
-            if sanitized is not None:
-                return sanitized, acted
-        return output, acted
+        return judged, acted
+
+    def _guard_list_result(
+        self,
+        call_id: str,
+        parts: list[Any],
+        func_name: str,
+        *,
+        tool_args: str,
+        my_generation: int = 0,
+        principal_id: str | None = None,
+        cancel_ref: StreamAbortRef | None = None,
+    ) -> OutputAssessment | None:
+        """Guard each text part of a list result in place; return the result's finding.
+
+        A list result carries text beside images.  Each text part a tool wrote
+        is guarded on its own, so a credential in any of them is redacted, and
+        the last flagged part's finding stands for the result.  Framework-written
+        parts (:class:`ControllerText`), such as the header ``read_file`` puts
+        before an image, pass by.  Both loops call this; the loop's names end
+        with the call, so no image part stays reachable after the step.
+        """
+        assessment: OutputAssessment | None = None
+        for part in parts:
+            if (
+                isinstance(part, dict)
+                and part.get("type") == "text"
+                and part.get("text")
+                and not isinstance(part["text"], ControllerText)
+            ):
+                part["text"], part_assessment = self._evaluate_output(
+                    call_id,
+                    part["text"],
+                    func_name,
+                    tool_args=tool_args,
+                    my_generation=my_generation,
+                    principal_id=principal_id,
+                    cancel_ref=cancel_ref,
+                )
+                if part_assessment is not None:
+                    assessment = part_assessment
+        return assessment
 
     def _batch_evaluate_outputs(
         self,
@@ -18481,10 +18531,10 @@ class ChatSession:
         self,
         assessment: OutputAssessment | None,
         func_name: str,
-        is_last_in_batch: bool,
         *,
-        result_index: int = 1,
-        result_count: int = 1,
+        received: str | list[Any] | None,
+        result_index: int,
+        result_count: int,
     ) -> list[tuple[str, str, dict[str, Any]]]:
         """Gather operator context for a tool result as system-turn specs.
 
@@ -18493,11 +18543,13 @@ class ChatSession:
         ``{"role": "system"}`` turn AFTER the tool message (the caller
         feeds each through :meth:`_append_system_turn`):
 
-        - **Output guard** findings (``source="output_guard"``) — rendered
-          inline here (flags + risk level + annotations + the
-          redaction notice).  Attach per-result, naming the result by its
-          position in the batch (*result_index* of *result_count*) and its
-          tool when the batch returned several.
+        - **Output guard** findings (``source="output_guard"``) — built by
+          :func:`~turnstone.core.tool_advisory.output_guard_advisory` (flags +
+          risk level + annotations + the redaction notice).  Attach
+          per-result, naming the result by its position in the batch
+          (*result_index* of *result_count*, from 1) and its tool when the
+          batch returned several, and checked against *received*, the result
+          as the model receives it.
         - **Queued user messages** (Seam 1, ``source="user_interjection"``)
           — drained on the LAST result of a batch.  ``meta`` carries the
           ``priority`` so the UI can frame important interjections
@@ -18514,6 +18566,7 @@ class ChatSession:
         on the last result only — no duplication across N tool results.
         """
         specs: list[tuple[str, str, dict[str, Any]]] = []
+        is_last_in_batch = result_index == result_count
 
         # Output guard advisory, built by the helper the task-agent loop shares
         # (structured ``meta`` first, text derived from it, so the prose the
@@ -18521,9 +18574,12 @@ class ChatSession:
         if assessment is not None:
             guard_content, guard_meta = output_guard_advisory(
                 assessment,
+                received=received,
                 index=result_index,
                 count=result_count,
-                tool=func_name,
+                # The model chose the name; only one this session offers is
+                # framework-known enough to print in an operator-trust turn.
+                tool=func_name if self._tool_is_registered(func_name) else "",
             )
             specs.append(("output_guard", guard_content, guard_meta))
 
@@ -26561,26 +26617,16 @@ class ChatSession:
                             cancel_ref=cancel_scope.cancel_ref,
                         )
                     elif isinstance(output, list):
-                        for part in output:
-                            if (
-                                isinstance(part, dict)
-                                and part.get("type") == "text"
-                                and part.get("text")
-                                and not isinstance(part["text"], ControllerText)
-                            ):
-                                part["text"], part_assessment = self._evaluate_output(
-                                    tc_dict["id"],
-                                    part["text"],
-                                    tool_name,
-                                    tool_args=guard_args,
-                                    my_generation=origin_generation,
-                                    principal_id=agent_principal,
-                                    cancel_ref=cancel_scope.cancel_ref,
-                                )
-                                if part_assessment is not None:
-                                    assessment = part_assessment
-                cut_after_guard = isinstance(output, str) and len(output) > _AGENT_TOOL_OUTPUT_CAP
-                if cut_after_guard:
+                        assessment = self._guard_list_result(
+                            tc_dict["id"],
+                            output,
+                            tool_name,
+                            tool_args=guard_args,
+                            my_generation=origin_generation,
+                            principal_id=agent_principal,
+                            cancel_ref=cancel_scope.cancel_ref,
+                        )
+                if isinstance(output, str) and len(output) > _AGENT_TOOL_OUTPUT_CAP:
                     output = _clip_agent_text(
                         output,
                         _AGENT_TOOL_OUTPUT_CAP,
@@ -26590,10 +26636,11 @@ class ChatSession:
                 if assessment is not None:
                     # The guard read past the clip, so a finding on a cut
                     # result may concern text the agent never receives; the
-                    # advisory says so.
+                    # advisory, checked against what the agent receives, says
+                    # so and keeps only the citations the clip left in place.
                     guard_content, _guard_meta = output_guard_advisory(
                         assessment,
-                        cut=cut_after_guard,
+                        received=output,
                         index=call_number,
                         count=call_count,
                         tool=tool_name,
@@ -26636,7 +26683,7 @@ class ChatSession:
             # Drop the just-completed provider response and last tool locals
             # before that summary/model call so the context swap is also a real
             # reachability boundary for multimodal/native payloads.
-            del result, tc_dict, prepared, output
+            del result, tc_dict, prepared, output, assessment
             turn += 1
             tool_progress_epoch += 1
 
@@ -28129,6 +28176,10 @@ class ChatSession:
                         cancel_ref=model_cancel_ref,
                         principal_id=principal_id,
                     ),
+                    # Only the extraction call reads this, and its prompt
+                    # declares no fence; its answer is a tool result the fold
+                    # cleans.
+                    tokens=(),
                     max_extracted_chars=max_content,
                     check_cancelled=_check_fetch_cancelled,
                 )
