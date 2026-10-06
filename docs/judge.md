@@ -534,11 +534,28 @@ The same merge runs live and on reconnect (both call
 `output_guard.merge_guard_display_payload`), so the chip can't drift between
 the two surfaces.
 
-The MODEL on the other side of the conversation is shown the merged
-`risk_level` + `flags` (via the `GuardAdvisory` spliced into the tool-result
-envelope), but is **never** told the judge cleared a finding — a judge fooled
-into "none" must not get to talk the model out of caution. The judge's
-"benign" verdict is operator-facing only.
+### What the model is shown
+
+The model reads a finding as an `output_guard` system turn after the tool
+results, built only from text the framework wrote. The judge read the
+attacker-controlled output, and the advisory carries operator-level trust, so
+nothing the judge wrote reaches the model: its reasoning and its flags as
+written stay on the chip and in the audit rows. The advisory carries:
+
+- the merged `risk_level`;
+- the heuristic's flags and annotations, unchanged (an admin-defined pattern's
+  annotation included);
+- for each flag only the judge raised, a symbol from a fixed vocabulary and
+  that symbol's one sentence. The judge's prompt lists the vocabulary
+  (`output_guard.JUDGE_SYMBOLS`). A flag outside it shows as `unclassified`,
+  and so does a judge finding that names no flag when nothing else names it.
+  Judge symbols follow the heuristic flags in vocabulary order, at most four
+  per finding;
+- the redaction notice when credentials were redacted.
+
+The judge's flags count only when its own verdict is above "none", and the
+model is **never** told the judge cleared a finding — a judge fooled into
+"none" must not get to talk the model out of caution.
 
 ### SSE event: `output_warning`
 

@@ -17374,10 +17374,11 @@ class ChatSession:
         """Run the output guard on tool result text.
 
         Two stages.  The heuristic regex stage always runs; the LLM judge
-        (issue #560 mitigation #1) runs when ``judge.output_guard_llm``
-        is enabled.  When both run and the LLM succeeds, the LLM verdict
-        is the *acted* assessment (informs redaction + UI + return);
-        otherwise the heuristic stands.  Both tier rows are persisted
+        (issue #560 mitigation #1) runs when ``judge.output_guard_llm`` is
+        enabled.  The operator's chip merges both verdicts; the model reads
+        a separate projection built only from controller-authored content
+        (:func:`~turnstone.core.output_guard.project_model_finding`).
+        Redaction is the heuristic's alone.  Both tier rows are persisted
         whenever the LLM ran, for audit completeness.
 
         ``tool_args`` is the JSON-string args the tool was called with
@@ -17392,7 +17393,8 @@ class ChatSession:
         row, warning, or sanitized result for a successor generation.
 
         Returns ``(possibly_sanitized_output, acted_assessment)``.  The
-        acted assessment is ``None`` when its risk_level is ``"none"``.
+        acted assessment is the model-facing projection, ``None`` when there
+        is nothing to show (merged risk ``"none"`` and nothing redacted).
         """
 
         def _check_owner() -> None:
@@ -17407,6 +17409,7 @@ class ChatSession:
             OutputAssessment,
             evaluate_output,
             merge_guard_display_payload,
+            project_model_finding,
         )
 
         judge_principal = principal_id
@@ -17478,14 +17481,16 @@ class ChatSession:
 
         output_len = len(output)
 
-        # Merge the two detectors into one acted finding (issue #560,
-        # "show, annotated").  Risk = max(heuristic, llm); flags = union.
-        # An LLM "none" — or a failed/absent LLM — never LOWERS a heuristic
-        # positive: the judge evaluates adversarial tool output, so it may
-        # escalate but must not be able to hide a deterministic regex
-        # finding.  Credential redaction stays a heuristic-only signal the
-        # LLM cannot override (bug-1 / sec-1): a secret is redacted whether
-        # or not the judge sees injection.
+        # The two detectors merge for the operator's chip (issue #560, "show,
+        # annotated"): risk = max(heuristic, llm), flags = union.  An LLM "none"
+        # — or a failed/absent LLM — never LOWERS a heuristic positive: the judge
+        # evaluates adversarial tool output, so it may escalate but must not be
+        # able to hide a deterministic regex finding.  The model reads a
+        # projection of the same finding at the merged risk, built from
+        # framework-written text only (``project_model_finding`` below).
+        # Credential redaction stays a heuristic-only signal the LLM cannot
+        # override (bug-1 / sec-1): a secret is redacted whether or not the
+        # judge sees injection.
         # ``llm`` is the narrowed, succeeded-only verdict (None on
         # disable / rate-limit / error / timeout) — lets the type checker
         # follow attribute access below without re-asserting succeeded.
@@ -17606,24 +17611,21 @@ class ChatSession:
         if d is None:
             return output, None
 
-        # Context-facing annotations (what the MODEL sees via the
-        # output_guard operator-context system turn):
-        # the heuristic findings, plus the LLM's reasoning ONLY when the LLM
-        # ESCALATED (flagged something itself).  We deliberately never inject
-        # the judge's "benign" reasoning into the model context — a judge
-        # fooled into "none" on a real heuristic finding must not get to tell
-        # the model the output is safe.  The operator UI still shows the full
-        # LLM verdict via the chip payload below.
-        context_annotations = list(heuristic.annotations)
-        if llm is not None and llm.risk_level != "none" and llm.reasoning:
-            context_annotations.append(llm.reasoning)
-        # acted's risk/flags come straight from the merge payload so the
-        # context advisory can't drift from the chip.
-        acted = OutputAssessment(
-            flags=list(d["flags"]),
+        # What the MODEL reads (the output_guard operator-context system
+        # turn) is selected, never generated: the judge wrote its reasoning
+        # and flags after reading attacker-controlled output, and the advisory
+        # carries operator-level trust.  So the model gets the heuristic's
+        # findings as they are plus the judge's flags mapped onto fixed
+        # symbols; the chip payload above keeps the judge's own words for the
+        # operator.  Risk is the merged level, so the advisory and the chip
+        # agree on it, and a judge fooled into "none" lowers nothing.
+        acted = project_model_finding(
             risk_level=str(d["risk_level"]),
-            annotations=context_annotations,
+            heuristic_flags=heuristic.flags,
+            heuristic_annotations=heuristic.annotations,
             sanitized=heuristic.sanitized,
+            judge_risk=llm.risk_level if llm else "none",
+            judge_flags=llm.flags if llm else (),
         )
 
         d["func_name"] = func_name

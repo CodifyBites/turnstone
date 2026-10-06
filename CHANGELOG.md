@@ -455,6 +455,15 @@ frozen.
 
 ### Security
 
+- **The model reads only framework-written output-guard findings (#1291).** With the LLM stage on
+  (`judge.output_guard_llm`), the advisory after a flagged tool result carried the judge's
+  reasoning and its free-form flags: text the judge wrote after reading the attacker-controlled
+  output, delivered with operator-level trust. The advisory now names what the judge found with
+  symbols from a fixed vocabulary, each with one fixed sentence, and a flag outside the vocabulary
+  shows as `unclassified`; the judge's prompt lists the same vocabulary. The chip and the audit
+  rows keep the judge's reasoning and flags as it wrote them, and findings from the regex stage
+  read as before. Workstreams created before the upgrade keep the advisories already stored in
+  them, judge prose included.
 - **Tool policies that cannot be read refuse the batch.** When reading the admin tool policies
   failed, every call came back as matching no policy, so `deny` rules stopped applying:
   skip-permissions, "Always" grants, auto-approve lists, the smart-approval judge or a person could

@@ -1438,3 +1438,22 @@ class TestOutputBudget:
         store._values["model.max_tokens"] = 12_000
         store.version += 1
         assert not judge.binding_is_current(binding, config)
+
+
+class TestFlagVocabulary:
+    """The judge is offered exactly the symbols the model-facing advisory shows."""
+
+    def test_prompt_lists_every_symbol_with_its_meaning(self) -> None:
+        from turnstone.core.output_guard import JUDGE_SYMBOLS
+
+        for symbol in JUDGE_SYMBOLS:
+            assert f"      {symbol.name}: {symbol.meaning}\n" in _SYSTEM_PROMPT
+
+    def test_prompt_lists_only_the_vocabulary(self) -> None:
+        import re
+
+        from turnstone.core.output_guard import JUDGE_FALLBACK_SYMBOL, JUDGE_SYMBOLS
+
+        listed = re.findall(r"^      ([a-z_]+): ", _SYSTEM_PROMPT, flags=re.MULTILINE)
+        assert listed == [symbol.name for symbol in JUDGE_SYMBOLS]
+        assert JUDGE_FALLBACK_SYMBOL.name not in _SYSTEM_PROMPT
