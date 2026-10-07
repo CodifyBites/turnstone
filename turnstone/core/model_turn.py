@@ -1405,6 +1405,7 @@ def model_turn(
     admit_request: Callable[[ModelLane], None] | None = None,
     validate_wire: Callable[[list[dict[str, Any]], ModelLane], None] | None = None,
     on_chunk: Callable[[StreamChunk], None] | None = None,
+    clean_trailing_info: Callable[[str], str] | None = None,
     product_recovery: bool = False,
     on_completed: Callable[[UsageInfo | None], None] | None = None,
     admit_reissue: Callable[[], None] | None = None,
@@ -1519,6 +1520,14 @@ def model_turn(
     so it can finalize visible attempts before replay. Product callback
     failures become :class:`ModelTurnLocalError`; cancellation exceptions
     pass through unchanged.
+
+    *clean_trailing_info* reaches :func:`drain_stream`, which runs it over a
+    hosted search's citations footer before folding it into the turn's
+    content: the page titles and URLs are text from outside that would
+    otherwise replay as the model's own.  A caller whose result is saved as an
+    assistant turn passes its cleaner for text from outside; one whose result
+    becomes a tool result does not, since the output guard reads that as it
+    came and the fold cleans it on the wire.
 
     Product callers set *product_recovery*: ordinary empty stops and transient
     response failures share two reissues, each requiring the adapter's final
@@ -1707,6 +1716,7 @@ def model_turn(
                         if on_chunk
                         else chunks,
                         scan_inline_reasoning=lane_scans_inline_reasoning(lane),
+                        clean_trailing_info=clean_trailing_info,
                     )
                 except Exception as exc:
                     response_error = exc

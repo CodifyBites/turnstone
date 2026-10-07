@@ -54,6 +54,7 @@ from turnstone.core.attachments import (
     Attachment,
     attached_file_label,
     neutralize_attachment_part,
+    neutralize_untrusted_fences,
     safe_attachment_label,
     sniff_image_mime,
     sniff_pdf_mime,
@@ -1085,6 +1086,8 @@ class _StreamTurnConsumer:
             self._flush_terminal_carries()
             if self._trailing_info and folds_trailing_info("".join(self._content_parts)):
                 for info in self._trailing_info:
+                    # Cleaned as the drain cleans the footer it folds in.
+                    info = self._session._clean_incoming_text(info)
                     self._flush_text(TRAILING_INFO_SEPARATOR + info, False)
             self._trailing_info = []
 
@@ -7092,6 +7095,30 @@ class ChatSession:
         """This session's fence tokens, which untrusted text on the wire must never carry."""
         return (self._envelope_nonce, self._sender_label_nonce)
 
+    def _clean_incoming_text(self, text: str) -> str:
+        """*text* from outside, its trusted markers defanged and this session's tokens removed.
+
+        The wire passes leave assistant and system turns as written, so text from
+        outside that the framework composes into one is cleaned where it is
+        composed: what a compaction summary quotes verbatim (the last user
+        message, the handles block), a hosted search's citations footer, a queued
+        message's interjection turn.  The summarizer reads every block through it
+        too (:meth:`_summary_blocks`), the model's own turns included.
+        """
+        return neutralize_untrusted_fences(text, tokens=self._fence_tokens())
+
+    def _summary_blocks(self, messages: list[dict[str, Any]]) -> list[str]:
+        """The compaction engine's blocks for *messages*, cleaned for the summarizer.
+
+        The summarizer reads only these and the engine's own prompt, so it
+        never reads a session token, and its summary, an assistant turn the
+        wire passes leave as written, is saved as it wrote it.
+        """
+        return [
+            self._clean_incoming_text(block)
+            for block in self._compaction_engine.summary_blocks(messages)
+        ]
+
     def _operator_prompt_addition(self, caps: ModelCapabilities) -> str:
         """Trust declaration required when operator turns use nonce fences."""
         if caps.supports_mid_conversation_system:
@@ -8602,12 +8629,15 @@ class ChatSession:
         out: list[dict[str, Any]] = []
         for m in messages:
             # Sender attribution is trusted only when this pass prepends it to
-            # a participant user turn.  Defang the same exact marker everywhere
-            # else first, including tool output and provider-native assistant
-            # plaintext, so a leaked session nonce cannot acquire authorship.
+            # a participant user turn.  Defang the same exact marker in all other
+            # text from outside first, tool output included, so a leaked session
+            # nonce cannot acquire authorship.  Assistant turns replay as
+            # returned; text from outside that the framework composes into one
+            # is cleaned there (_clean_incoming_text), a hosted search's native
+            # result and citation blocks excepted.
             safe_message = (
                 m
-                if m.get("role") == "system"
+                if m.get("role") in ("system", "assistant")
                 else neutralize_message_fence_markers(
                     m, fence.SENDER_LABEL_TAG, token=self._sender_label_nonce
                 )
@@ -9300,6 +9330,7 @@ class ChatSession:
         resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
         validate_wire: Callable[[list[dict[str, Any]], ModelLane], None] | None = None,
         use_session_temperature: bool = True,
+        clean_trailing_info: Callable[[str], str] | None = None,
     ) -> ModelTurnResult:
         """Run a lightweight internal completion (title gen, compaction,
         extraction) through ``model_turn`` on the session's primary lane.
@@ -9366,6 +9397,11 @@ class ChatSession:
 
         ``validate_wire`` is an optional final local size check after that
         materialization. It runs inside :func:`model_turn` before provider I/O.
+
+        ``clean_trailing_info`` reaches :func:`model_turn`: compaction passes
+        :meth:`_clean_incoming_text`, since its result is saved as an assistant
+        turn.  Extraction leaves it out: its answer becomes a tool result, which
+        the output guard reads as it came and the fold cleans on the wire.
         """
         lane = lane or self._primary_lane()
         effective_principal_id = (
@@ -9398,6 +9434,7 @@ class ChatSession:
             acting_principal_id=effective_principal_id,
             resolve_attachments=resolve_attachments,
             validate_wire=validate_wire,
+            clean_trailing_info=clean_trailing_info,
         )
 
     def _record_aux_usage(self, usage: UsageInfo | None, *, model: str | None = None) -> None:
@@ -9928,6 +9965,7 @@ class ChatSession:
                     cancel_ref=ref,
                     acting_principal_id=principal_id or "",
                     on_chunk=consumer,
+                    clean_trailing_info=self._clean_incoming_text,
                     product_recovery=True,
                 )
             except Exception as e:
@@ -15632,6 +15670,10 @@ class ChatSession:
                 principal_id=resolved_principal,
                 reasoning_effort=reasoning_effort,
                 use_session_temperature=use_session_temperature,
+                # A summary is saved as an assistant turn as the summarizer
+                # wrote it; a citations footer folded into it is text from
+                # outside.
+                clean_trailing_info=self._clean_incoming_text,
             )
 
         progress: Callable[[dict[str, Any]], None]
@@ -15719,7 +15761,8 @@ class ChatSession:
 
         Sanitiser ruling, one oracle for the whole block — ``sanitize_display``:
 
-        * Model-authored text (titles, notes, child names) is sanitised.  The
+        * Free text (task titles and notes, from the coordinator's own task
+          calls; child names, which others can rename) is sanitised.  The
           control class is what this render actually needs: these are single-line
           list rows, and a newline inside a title would forge a sibling row the
           model then reads as a real task.  That class is identical in both
@@ -16232,7 +16275,12 @@ class ChatSession:
             split = len(to_summarize)  # preserved == self.messages[split:]
             real_users = self._find_turn_boundaries()
             if real_users and real_users[-1] < split:  # summarized, not preserved
-                last_user_content = self.messages[real_users[-1]].text or ""
+                # Quoted into the summary's assistant turn, which the wire
+                # passes leave as written: cleaned here, as the fold cleans it
+                # in its own turn.
+                last_user_content = self._clean_incoming_text(
+                    self.messages[real_users[-1]].text or ""
+                )
 
         # Build summary blocks from ALL of to_summarize (per-message), then
         # summarize via chunked/hierarchical compaction.  Sizing by the actual
@@ -16242,7 +16290,7 @@ class ChatSession:
         # selection — not a fitting prefix — also fixes the latent drop of the
         # most-recent (unselected) messages.
         to_summarize_dicts = dicts_from_turns(to_summarize)
-        blocks = self._compaction_engine.summary_blocks(to_summarize_dicts)
+        blocks = self._summary_blocks(to_summarize_dicts)
         if not blocks:
             return self._compaction_bailed(
                 "not_enough_messages",
@@ -16367,13 +16415,21 @@ class ChatSession:
             self._compaction_engine.carry_budget_chars(summary_runtime, carries) if carries else 0
         )
 
+        # The summarizer read cleaned blocks (_summary_blocks), so its summary
+        # stays as it wrote it, as does the wind-down spill, the model's own
+        # last turn.
         summary = summary_result.text
 
         # Handles first (state the harness knows exactly), then wind-down, then
         # how to resume — the summary reads: sections, the ids still in play,
         # what the model recorded, then the ask to continue from.
         if handles:
-            summary += self._render_handles_block(task_lines, child_lines, carry_budget)
+            # The whole block is cleaned: a child's name is anyone's rename,
+            # text from outside in the summary's assistant turn, which the
+            # wire passes leave as written.
+            summary += self._clean_incoming_text(
+                self._render_handles_block(task_lines, child_lines, carry_budget)
+            )
 
         carry_truncated = False
         if spill_text:
@@ -18617,7 +18673,10 @@ class ChatSession:
                     # "queued message" bubble (the operator reads the
                     # message, not the model-directed preamble) with priority
                     # emphasis.  Both derive from ``(text, priority)``.
-                    framed = render_user_interjection(text, priority)
+                    # The participant's words are text from outside in a
+                    # system turn, which the wire passes leave as written:
+                    # cleaned here, while the card shows them as written.
+                    framed = render_user_interjection(self._clean_incoming_text(text), priority)
                     interjection_meta = {"priority": priority, "message": text}
                     sender = _queued_row_owner(row)
                     if sender:
@@ -25854,6 +25913,7 @@ class ChatSession:
                     cancel_ref=cancel_scope.cancel_ref,
                     acting_principal_id=agent_principal,
                     prepare_wire=self._prepare_task_agent_wire,
+                    clean_trailing_info=self._clean_incoming_text,
                 )
             except Exception:
                 cancel_scope.check()
@@ -26024,9 +26084,7 @@ class ChatSession:
             # summarize only the replaceable suffix. Including the task prompt
             # in both places wastes the reclaimed budget and lets a paraphrase
             # compete with the authoritative delegation contract.
-            blocks = self._compaction_engine.summary_blocks(
-                dicts_from_turns(context_turns[len(agent_prefix) :])
-            )
+            blocks = self._summary_blocks(dicts_from_turns(context_turns[len(agent_prefix) :]))
             if not blocks:
                 failed_compaction_signature = signature
                 return False

@@ -396,15 +396,25 @@ def fold_system_turns(
     wire turn's content, then dropped from the list.
 
     Forgery defence is two-layer: ``fence.wrap`` neutralises the operator body's
-    closing marker (break-out), and every untrusted non-system text host is
-    neutralised before any real fence is appended (forge-in): its markers are
-    defanged and the session's token itself is removed, so of the text this pass
-    sees, only a fence it appends carries the token.  This includes terminal
-    hosts with no following operator turn and native lanes that inherit a
-    non-native primary's trust declaration during fallback.  The host pass runs
-    before folding so it can never defang a real fence appended here.  An
-    attachment, which joins the request later, is cleaned where it joins; text
-    inside an image or a natively read PDF is beyond the reach of any text pass.
+    closing marker (break-out), and every text host that came from outside (any
+    message but a system message and the model's own turns) is neutralised
+    before any real fence is appended (forge-in): its markers are defanged and
+    the session's token itself is removed, so of the text from outside, only a
+    fence appended here carries the token.  This includes terminal hosts with no
+    following operator turn and native lanes that inherit a non-native primary's
+    trust declaration during fallback.  The host pass runs before folding so it
+    can never defang a real fence appended here.  An attachment, which joins the
+    request later, is cleaned where it joins; text inside an image, a natively
+    read PDF or a hosted search's results and citations (which replay in the
+    assistant turn's native blocks) is beyond the reach of any text pass.  The
+    model's own turns replay as it wrote them; text from outside that the
+    framework writes into an assistant turn (what a compaction summary quotes, a
+    hosted search's citations footer) or a system turn (a queued message) is
+    cleaned where it is composed, and the summarizer reads cleaned history.  So
+    the token reaches the model's history from outside only inside a search
+    result or a citation, which sit in the model's own turns, where the
+    declaration says a block is never the operator's; anywhere else, a block
+    with it is one the model wrote itself.
 
     Native models (*supports_mid_conversation_system*) keep the turns inline —
     the provider converter emits them as real ``system`` messages.  Base-prompt
@@ -428,7 +438,7 @@ def fold_system_turns(
     for idx, msg in enumerate(messages):
         safe = (
             neutralize_message_fence_markers(msg, fence.SYSTEM_REMINDER_TAG, token=nonce)
-            if msg.get("role") != "system"
+            if msg.get("role") not in ("system", "assistant")
             else msg
         )
         if safe is not msg:
@@ -479,12 +489,11 @@ def neutralize_message_fence_markers(
     """Return a copy of *msg* with *tag* fence markers defanged in plaintext.
 
     This is the shared copy-on-write trust-boundary pass for operator and sender
-    fences.  It covers canonical string/multipart text plus editable top-level
-    provider-native ``type=text`` blocks; otherwise Anthropic replay could prefer
-    an untouched native block and resurrect a marker defanged in the canonical
-    mirror.  Signed thinking, encrypted reasoning/server-tool blocks, tool-use
-    structures, and other opaque native content remain byte-exact.  Trusted
-    system messages are excluded by callers.  Never mutates *msg*.
+    fences, over canonical string/multipart text.  Callers pass only text that
+    came from outside, which carries no provider-native lane: system messages
+    are trusted, and assistant turns replay as returned, native blocks included,
+    which can hold a hosted search's results and citations that no text pass
+    reaches.  Never mutates *msg*.
 
     *token*, the fence's session token, is also removed wherever it appears
     (:func:`turnstone.core.fence.remove_token`): the declarations trust a block
@@ -517,24 +526,6 @@ def neutralize_message_fence_markers(
                     safe_parts[idx] = {**part, "text": safe}
         if safe_parts is not None:
             updates["content"] = safe_parts
-
-    provider_content = msg.get("_provider_content")
-    if isinstance(provider_content, list):
-        safe_blocks: list[Any] | None = None
-        for idx, block in enumerate(provider_content):
-            if (
-                isinstance(block, dict)
-                and block.get("type") == "text"
-                and isinstance(block.get("text"), str)
-            ):
-                text = block["text"]
-                safe = _safe(text)
-                if safe != text:
-                    if safe_blocks is None:
-                        safe_blocks = list(provider_content)
-                    safe_blocks[idx] = {**block, "text": safe}
-        if safe_blocks is not None:
-            updates["_provider_content"] = safe_blocks
     return msg if not updates else {**msg, **updates}
 
 

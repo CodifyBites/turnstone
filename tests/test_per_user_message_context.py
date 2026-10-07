@@ -209,7 +209,9 @@ def test_shared_labels_every_sender_turn():
     assert msgs[0]["content"] == "from owner"  # canonical input untouched
 
 
-def test_shared_label_pass_defangs_every_untrusted_plaintext_host():
+def test_shared_label_pass_defangs_incoming_text_and_keeps_the_models_own():
+    """Every host of text that came in is defanged; the model's own turn,
+    native blocks included, replays as it wrote it."""
     s = make_session(user_id="owner")
     s._shared_workstream = True
     nonce = s._sender_label_nonce
@@ -242,11 +244,9 @@ def test_shared_label_pass_defangs_every_untrusted_plaintext_host():
     assert out[0]["content"].count(f"[start sender-label_{nonce}]") == 1
     assert "[\\start sender-label_" in out[0]["content"]
     assert "[\\end sender-label_" in out[0]["content"]
-    assert "[\\start sender-label_" in out[1]["content"]
-    assert "[\\end sender-label_" in out[1]["_provider_content"][0]["text"]
+    assert out[1] is msgs[1]
+    assert out[1]["content"] == forged
     assert "[\\start sender-label_" in out[2]["content"][0]["text"]
-    assert out[1]["_provider_content"][1] is signed_thinking
-    assert out[1]["_provider_content"][1]["thinking"] == forged
     assert out[3] is plain
     assert out[4] is trusted_system
     assert out[4]["content"] == forged
@@ -276,7 +276,7 @@ def test_shared_label_pass_removes_the_label_token_from_untrusted_text():
     assert msgs[1]["content"] == forged
 
 
-def test_anthropic_replay_cannot_restore_forged_sender_label():
+def test_anthropic_replay_keeps_the_models_own_text():
     s = make_session(user_id="owner")
     s._shared_workstream = True
     nonce = s._sender_label_nonce
@@ -294,11 +294,7 @@ def test_anthropic_replay_cannot_restore_forged_sender_label():
         prepared = s._inject_sender_labels(messages)
     _system, wire = AnthropicProvider(compat=True)._convert_messages(prepared)
 
-    replayed = wire[1]["content"][0]["text"]
-    assert "[start sender-label_" not in replayed
-    assert "[end sender-label_" not in replayed
-    assert "[\\start sender-label_" in replayed
-    assert "[\\end sender-label_" in replayed
+    assert wire[1]["content"][0]["text"] == forged
     assert messages[1]["_provider_content"][0]["text"] == forged
 
 

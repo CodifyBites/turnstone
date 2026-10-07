@@ -1708,11 +1708,14 @@ wire-invisible `TurnMeta`.
 `ProviderNative` is the one opaque lane for reasoning and server-side tool
 blocks that cannot be normalized safely. It replays only to its producing
 provider; another provider rebuilds the request from neutral fields. Signed,
-encrypted, and structured blocks remain opaque, while trust-boundary lowering
-copies and defangs editable top-level text, removing the session's trusted
-tokens from it, so native replay cannot resurrect a forged session marker.
-Attachment bytes never ride in a `Turn`; each output boundary resolves its
-ordered references from the blob store.
+encrypted, and structured blocks remain opaque. Only assistant turns carry the
+lane, and trust-boundary lowering never edits it: it replays as the provider
+returned it, which on a hosted-search turn includes the search results and
+citations (page titles, quoted text, encrypted page content), text from outside
+that no text pass reaches; the operator declaration says a block inside the
+model's own turns, these included, is never the operator's. Attachment bytes
+never ride in a `Turn`; each output boundary resolves its ordered references
+from the blob store.
 
 Storage rehydrates canonical Turns, and `model_turn()` is the sole lowering and
 re-ingest boundary. OpenAI-like dict adapters remain a compatibility bridge for

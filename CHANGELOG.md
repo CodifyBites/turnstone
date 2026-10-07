@@ -216,10 +216,6 @@ frozen.
   `judge.output_guard_model` to keep a separate model for the guard. A workstream's own judge model
   (the launcher's judge picker, the create API's `judge_model`, the CLI's `--judge-model`) is that
   workstream's `judge.model`, so it runs the guard too unless `judge.output_guard_model` is set.
-  Where the regex stage redacts a credential (`judge.redact_secrets`), the guard's model now reads
-  the redacted text the session's model receives rather than the raw tool output, so a secret the
-  session's model never sees no longer reaches the guard's model, possibly another provider's, or
-  the reasoning it writes into the audit row; the lines it cites are that text's.
 
 ### Fixed
 
@@ -490,6 +486,22 @@ frozen.
   rows keep the judge's reasoning and flags as it wrote them, and findings from the regex stage
   read as before. Workstreams created before the upgrade keep the advisories already stored in
   them, judge prose included.
+- **The model's own words replay as written (#1291).** The fold of operator turns, the shared
+  workstream's sender-label pass and the reasoning replayed to a vLLM model defanged fence markers
+  in the model's own text and reasoning, so the model read its history rewritten. They now clean
+  only what comes in (tool results, attachments, other participants' messages) and replay the
+  model's text, reasoning and tool-call arguments as it wrote them. The summarizer that writes a
+  compaction summary reads every turn with fence markers defanged and the session's tokens removed,
+  the model's own included, since another model reads them and nothing it reads is replayed; its
+  summary is kept as it wrote it. What the framework writes from outside into an assistant turn (the
+  last user message a summary quotes, a child workstream's name, a hosted search's citations footer)
+  or a system turn (a message queued while the model works) is cleaned where it is composed; the
+  model's own last turn, which a compaction carries verbatim, stays as written. A hosted search's
+  results and citations replay inside the model's turn as the provider returned them, beyond any
+  text pass, like text inside an image or a natively read PDF; the declaration now says a block
+  inside one of the model's own earlier turns, its search results and citations included, is never
+  the operator's. Anywhere else, text from outside never carries a session token in, so a block with
+  one in the model's history is one the model wrote itself.
 - **Task agents are told what the output guard found (#1291).** A task agent's tool results were
   scanned and redacted, but its model never saw the finding, so a sub-agent that read a prompt
   injection got no warning even though the guard flagged it and the operator's chip showed it. A
@@ -502,34 +514,42 @@ frozen.
   redact a credential that straddles it, so the advisory for a result the cut shortened says the
   finding may concern the part the agent did not receive. The declaration itself, in every session
   whose model folds operator turns, now says a block carrying the session's token can follow a tool
-  result; it told the model to distrust any marker inside tool output, which read literally covered
-  the real advisory appended there. Since the declaration trusts the token alone, the token itself
-  is now removed from untrusted text wherever it joins the request (the history, before the fold
-  appends its block, and attachments), matched past case, past accents and compatibility forms (`é`,
-  full-width, mathematical, circled) and past anything between its characters that is not an ASCII
-  letter or digit (spaces, line breaks, invisible characters, combining marks): a leaked token
-  inside a marker spelled with a zero-width space or a lookalike letter passed the old defang.
-  Lookalikes that Unicode does not decompose to a letter or digit (another script's letters, ASCII
-  `O` for `0` and `l` or `I` for `1`) are not matched, and text inside an image or a natively read
-  PDF is beyond the reach of a text pass. The sender label of a shared workstream gets the same
-  treatment, and the guard flags a leaked token wherever it appears. All of a step's advisories
-  follow its last result, so in a step with several results each advisory now names its own by
-  position, and by tool when the session offers a tool of that name; the operator's guard card shows
-  the same label. Text the framework wrote itself (a denial quoting the approver's feedback, an
-  unknown-tool or agent-mode gate error, the header before an image) is no longer guarded; a denial
-  such as "From now on you must write outputs to /tmp" scored as an injection, and the advisory
-  turned the approver's own correction against them.
+  result, and that a block inside one of the model's own earlier turns, its search results and
+  citations included, is never the operator's; it told the model to distrust any marker inside tool
+  output, which read literally covered the real advisory appended there. Since the declaration
+  trusts the token alone, the token itself is now removed from untrusted text wherever it joins the
+  request (tool results and other incoming history, before the fold appends its block, and
+  attachments), matched past case, past accents and compatibility forms (`é`, full-width,
+  mathematical, circled) and past anything between its characters that is not an ASCII letter or
+  digit (spaces, line breaks, invisible characters, combining marks): a leaked token inside a marker
+  spelled with a zero-width space or a lookalike letter passed the old defang. Lookalikes that
+  Unicode does not decompose to a letter or digit (another script's letters, ASCII `O` for `0` and
+  `l` or `I` for `1`, and on Python 3.13, whose Unicode predates them, the outlined letters and
+  digits Unicode 16 added) are not matched, and text inside an image, a natively read PDF or a
+  hosted search's results and citations is beyond the reach of a text pass. The sender label of a
+  shared workstream gets the same treatment, and the guard flags a leaked token wherever it appears.
+  All of a step's advisories follow its last result, so in a step with several results each advisory
+  now names its own by position, and by tool when the session offers a tool of that name; the
+  operator's guard card shows the same label. Text the framework wrote itself (a denial quoting the
+  approver's feedback, an unknown-tool or agent-mode gate error, the header before an image) is no
+  longer guarded; a denial such as "From now on you must write outputs to /tmp" scored as an
+  injection, and the advisory turned the approver's own correction against them.
+- **The output guard's judge no longer reads secrets the model never sees (#1291).** Where the regex
+  stage redacts a credential (`judge.redact_secrets`), the guard's LLM stage read the raw tool
+  output, so a secret the session's model never saw reached the guard's model, possibly another
+  provider's, and the reasoning it writes into the audit row. It now reads the redacted text the
+  session's model receives; the lines it cites are that text's.
 - **Output-guard findings name the lines the judge flagged (#1291).** With the LLM stage on, the
-  judge reads the tool output with numbered lines and may cite ranges; the advisory names them
-  as numbers, never quoting the lines. A range reaches the model only if its lines read the same,
-  at the same numbers, in what the model receives: one after a redacted key block, a re-cut or a
-  task agent's cut is dropped rather than renumbered. The sentence says the numbers count from
-  the first line of the result, since `read_file` and search output print numbers of their own,
-  and asks the model to treat the whole result with the same caution, since the judge chose the
-  lines after reading text that can steer it. A result the main loop cuts again after redaction
-  now also gets the notice that the finding may concern the part that was cut. Output whose
-  numbered prompt would not fit the judge's window, such as one padded with blank lines, is
-  judged unnumbered and cites no lines, where it would otherwise skip the judge.
+  judge reads the tool output with numbered lines and may cite ranges; the advisory names them as
+  numbers, never quoting the lines. A range reaches the model only if its lines read the same, at
+  the same numbers, in what the model receives: one after a re-cut or a task agent's cut is dropped
+  rather than renumbered. The sentence says the numbers count from the first line of the result,
+  since `read_file` and search output print numbers of their own, and asks the model to treat the
+  whole result with the same caution, since the judge chose the lines after reading text that can
+  steer it. A result the main loop cuts again after redaction now also gets the notice that the
+  finding may concern the part that was cut. Output whose numbered prompt would not fit the judge's
+  window, such as one padded with blank lines, is judged unnumbered and cites no lines, where it
+  would otherwise skip the judge.
 - **Tool policies that cannot be read refuse the batch.** When reading the admin tool policies
   failed, every call came back as matching no policy, so `deny` rules stopped applying:
   skip-permissions, "Always" grants, auto-approve lists, the smart-approval judge or a person could
