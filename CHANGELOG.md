@@ -188,6 +188,14 @@ frozen.
   negotiates content may now return HTML where it previously returned JSON or CSV, and some image
   hosts (for example `i.imgur.com`, `i.redd.it`) redirect a direct image link to their HTML page,
   which a preview shows without its scripts.
+- **The output guard judges on `judge.model` when it has no model of its own (#1291).** With
+  `judge.output_guard_model` empty, the guard's LLM stage ran on the session's model, the model
+  whose tool output it judges. It now uses `judge.model`, and the session's model only when that
+  is empty too; a set alias that is not registered is passed over with a warning. Installs that set
+  `judge.model` but not `judge.output_guard_model` switch the guard's model on upgrade: the guard
+  then shares that alias's `max_concurrency` with the intent judge, and long tool output may exceed
+  a small judge's context window, which skips the LLM stage for that result. Set
+  `judge.output_guard_model` to keep a separate model for the guard.
 
 ### Fixed
 

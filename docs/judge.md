@@ -486,7 +486,11 @@ judge.redact_secrets = true  # auto-redact detected credentials (default)
 Configure both at runtime through the admin Judge settings.
 
 The LLM stage (`judge.output_guard_llm`, off by default) runs the model named
-by `judge.output_guard_model`, or the session's model when that is empty. Its
+by `judge.output_guard_model`, else the one named by `judge.model`, else the
+session's model; a set alias that is not registered is passed over with a
+warning. On `judge.model` the guard shares that alias's `max_concurrency` with
+the intent judge, and long tool output needs a context window to match, so
+setting `judge.output_guard_model` gives the guard a model of its own. Its
 output cap is that model's own `max_tokens`: the alias's value, else the
 `model.max_tokens` setting (32,768 unless changed), never above the model's
 advertised maximum output. The cap is fitted to the context window the prompt

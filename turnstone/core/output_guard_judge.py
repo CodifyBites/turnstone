@@ -309,13 +309,35 @@ def _extract_json(text: str) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 
 
+def _configured_guard_aliases(config: JudgeConfig) -> list[tuple[str, str]]:
+    """The judging aliases the operator set, as ``(setting, alias)``, in the guard's order."""
+    return [
+        (f"judge.{field}", alias)
+        for field in ("output_guard_model", "model")
+        if (alias := str(getattr(config, field) or "").strip())
+    ]
+
+
+def _guard_alias(config: JudgeConfig, registry: Any | None) -> str:
+    """The alias the guard's LLM stage asks for, or ``""`` for the session's model.
+
+    ``judge.output_guard_model``, else ``judge.model``: a judging model the
+    operator chose, kept apart from the model whose tool output is judged.  A
+    set alias the registry does not hold is passed over for the next one.
+    """
+    for _setting, alias in _configured_guard_aliases(config):
+        if registry is None or registry.has_alias(alias):
+            return alias
+    return ""
+
+
 class OutputGuardJudge:
     """Synchronous, single-shot LLM judge for tool output.
 
-    Construction resolves the configured ``judge.output_guard_model``
-    alias inline; on resolution failure (alias unset or unknown) the
-    session model is used as a fallback.  Mirrors :class:`IntentJudge`'s
-    own alias resolution.
+    Construction resolves the guard's alias inline (:func:`_guard_alias`:
+    ``judge.output_guard_model``, else ``judge.model``); on resolution
+    failure (no alias set, or none registered) the session model is used as
+    a fallback.  Mirrors :class:`IntentJudge`'s own alias resolution.
 
     The HTTP client is lazy-initialised on the first ``evaluate()`` call
     and reused for the lifetime of the judge instance — see
@@ -344,9 +366,10 @@ class OutputGuardJudge:
             getattr(session_binding.config, "context_window", None),
             session_caps.context_window,
         )
-        # Alias resolution mirrors IntentJudge.__init__.
-        # An empty / unset alias falls through to the session model silently;
-        # a set-but-unknown alias logs a warning and also falls through.
+        # Alias resolution mirrors IntentJudge.__init__, over the guard's two
+        # settings (``_guard_alias``).  With neither set the session model
+        # judges, silently; a set alias the registry does not hold logs a
+        # warning and is passed over for the next, then the session model.
         # Judge model's context window drives the oversize-output guard in
         # ``evaluate``.  It comes from the registry's ModelConfig on the alias
         # path and the session binding's resolved window on the fallback path — NEVER
@@ -356,8 +379,21 @@ class OutputGuardJudge:
         # local judges it exists to protect.  ``_positive_window`` also
         # defensively coerces any non-positive window (which would zero out the
         # guard) to the session window, then a floor.
-        requested_alias = str(config.output_guard_model or "").strip()
         registry = session_binding.lane.registry
+        requested_alias = _guard_alias(config, registry)
+        requested_setting = ""
+        for setting, alias in _configured_guard_aliases(config):
+            if alias == requested_alias:
+                requested_setting = setting
+                break
+            log.warning(
+                "%s=%r is not a registered alias — the output guard uses the next "
+                "judging model, or the session's.  Register the model in the Models "
+                "tab and set %s to its alias.",
+                setting,
+                alias,
+                setting,
+            )
         config_version_at_start = _config_store_version(config_store)
         binding = _judge_binding_from_session(session_binding, config_store)
         resolved = False
@@ -388,20 +424,22 @@ class OutputGuardJudge:
                 # cause — the register-the-alias advice below would
                 # misdiagnose a row that is already registered.
                 log.warning(
-                    "judge.output_guard_model=%r is registered but its client "
-                    "could not be constructed (%s) — falling back to session "
-                    "model %r.",
+                    "%s=%r is registered but its client could not be constructed "
+                    "(%s) — falling back to session model %r.",
+                    requested_setting,
                     requested_alias,
                     construction_error,
                     session_binding.lane.model,
                 )
             elif requested_alias:
                 log.warning(
-                    "judge.output_guard_model=%r is not a registered alias — "
-                    "falling back to session model %r.  Register the model in "
-                    "the Models tab and set judge.output_guard_model to its alias.",
+                    "%s=%r is not a registered alias — falling back to session "
+                    "model %r.  Register the model in the Models tab and set %s "
+                    "to its alias.",
+                    requested_setting,
                     requested_alias,
                     session_binding.lane.model,
+                    requested_setting,
                 )
             binding = _judge_binding_from_session(session_binding, config_store)
 
@@ -470,7 +508,7 @@ class OutputGuardJudge:
             return False
         if not self._binding_state.is_current(
             session_binding,
-            requested_alias=str(config.output_guard_model or "").strip(),
+            requested_alias=_guard_alias(config, session_binding.lane.registry),
         ):
             return False
         # ``model.max_tokens`` is not part of the lane, so a change to it alone

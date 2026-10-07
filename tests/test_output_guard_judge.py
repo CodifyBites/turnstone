@@ -574,6 +574,94 @@ class TestAliasResolution:
         assert judge._model == "claude-haiku-4-5"
         assert judge._judge_model_alias == "my-judge"
 
+    @staticmethod
+    def _registry(*aliases: str) -> MagicMock:
+        registry = MagicMock()
+        registry.generation = 0
+        registry.has_alias.side_effect = lambda alias: alias in aliases
+        alias_provider = MagicMock()
+        alias_provider.provider_name = "anthropic"
+        alias_provider.get_capabilities.return_value = ModelCapabilities(context_window=200_000)
+        registry.resolve_binding.side_effect = lambda alias, **_kw: (
+            MagicMock(base_url=f"http://{alias}", api_key="k"),
+            f"{alias}-model",
+            None,
+            alias_provider,
+            0,
+        )
+        return registry
+
+    def _guard(self, config: JudgeConfig, registry: MagicMock) -> OutputGuardJudge:
+        return OutputGuardJudge(
+            config=config,
+            session_binding=_binding(
+                _make_provider(),
+                MagicMock(base_url="http://session", api_key="s"),
+                "session-model",
+                registry=registry,
+                alias="session",
+            ),
+        )
+
+    def test_judge_model_judges_when_the_guard_has_no_alias(self) -> None:
+        """An operator who chose a judging model gets it for tool output too,
+        not the model whose output is being judged."""
+        judge = self._guard(
+            JudgeConfig(output_guard_llm=True, model="intent"), self._registry("intent")
+        )
+        assert judge._model == "intent-model"
+        assert judge._judge_model_alias == "intent"
+
+    def test_the_guards_own_alias_wins(self) -> None:
+        judge = self._guard(
+            JudgeConfig(output_guard_llm=True, output_guard_model="guard", model="intent"),
+            self._registry("guard", "intent"),
+        )
+        assert judge._judge_model_alias == "guard"
+
+    def test_an_unregistered_guard_alias_is_passed_over_for_judge_model(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level("WARNING"):
+            judge = self._guard(
+                JudgeConfig(output_guard_llm=True, output_guard_model="typo", model="intent"),
+                self._registry("intent"),
+            )
+        assert judge._judge_model_alias == "intent"
+        assert "is not a registered alias" in caplog.text
+        assert "'judge.output_guard_model', 'typo'" in caplog.text
+
+    def test_with_neither_registered_the_session_model_judges(self) -> None:
+        judge = self._guard(
+            JudgeConfig(output_guard_llm=True, output_guard_model="typo", model="also-typo"),
+            self._registry(),
+        )
+        assert judge._model == "session-model"
+        assert judge._judge_model_alias == ""
+
+    def test_a_judge_model_edit_reaches_a_guard_without_its_own_alias(self) -> None:
+        registry = self._registry("a", "b", "guard")
+        session_binding = _binding(
+            _make_provider(),
+            MagicMock(base_url="http://session", api_key="s"),
+            "session-model",
+            registry=registry,
+            alias="session",
+        )
+        inherited = OutputGuardJudge(JudgeConfig(output_guard_llm=True, model="a"), session_binding)
+        assert inherited.binding_is_current(
+            session_binding, JudgeConfig(output_guard_llm=True, model="a")
+        )
+        assert not inherited.binding_is_current(
+            session_binding, JudgeConfig(output_guard_llm=True, model="b")
+        )
+        own = JudgeConfig(output_guard_llm=True, output_guard_model="guard", model="a")
+        guard = OutputGuardJudge(own, session_binding)
+        assert guard.binding_is_current(
+            session_binding,
+            JudgeConfig(output_guard_llm=True, output_guard_model="guard", model="b"),
+        )
+
 
 class TestBindingFreshness:
     def test_constructor_consumed_timeout_change_invalidates(self) -> None:
