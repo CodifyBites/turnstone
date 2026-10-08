@@ -116,6 +116,7 @@ services:
       TURNSTONE_OIDC_REDIRECT_BASE: https://turnstone.prod.codifybites.com
       TURNSTONE_OIDC_PROVIDER_NAME: Authentik
       TURNSTONE_OIDC_PASSWORD_ENABLED: "true"
+      TURNSTONE_OIDC_ALLOW_PRIVATE_NETWORK: "true"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
@@ -226,6 +227,7 @@ services:
       TURNSTONE_OIDC_REDIRECT_BASE: https://turnstone.prod.codifybites.com
       TURNSTONE_OIDC_PROVIDER_NAME: Authentik
       TURNSTONE_OIDC_PASSWORD_ENABLED: "true"
+      TURNSTONE_OIDC_ALLOW_PRIVATE_NETWORK: "true"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
