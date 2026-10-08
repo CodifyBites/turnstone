@@ -117,6 +117,8 @@ services:
       TURNSTONE_OIDC_PROVIDER_NAME: Authentik
       TURNSTONE_OIDC_PASSWORD_ENABLED: "true"
       TURNSTONE_OIDC_ALLOW_PRIVATE_NETWORK: "true"
+      TURNSTONE_OIDC_ROLE_CLAIM: ${TURNSTONE_OIDC_ROLE_CLAIM:-groups}
+      TURNSTONE_OIDC_ROLE_MAP: ${TURNSTONE_OIDC_ROLE_MAP:-authentik Admins:builtin-admin,devOps:builtin-operator}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
@@ -228,6 +230,8 @@ services:
       TURNSTONE_OIDC_PROVIDER_NAME: Authentik
       TURNSTONE_OIDC_PASSWORD_ENABLED: "true"
       TURNSTONE_OIDC_ALLOW_PRIVATE_NETWORK: "true"
+      TURNSTONE_OIDC_ROLE_CLAIM: ${TURNSTONE_OIDC_ROLE_CLAIM:-groups}
+      TURNSTONE_OIDC_ROLE_MAP: ${TURNSTONE_OIDC_ROLE_MAP:-authentik Admins:builtin-admin,devOps:builtin-operator}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
