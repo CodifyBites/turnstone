@@ -33,6 +33,10 @@ name: turnstone
 networks:
   turnstone-net:
     driver: bridge
+  # Shared Arcane/Pangolin ingress network, managed outside this project.
+  proxy:
+    external: true
+    name: proxy
 
 volumes:
   turnstone-data:
@@ -110,6 +114,15 @@ services:
       - "host.docker.internal:host-gateway"
     networks:
       - turnstone-net
+      - proxy
+    labels:
+      - "arcane.server.hosts=CodeServer"
+      - "pangolin.enable=true"
+      - "pangolin.protected=true"
+      - "pangolin.domain=prod.codifybites.com"
+      - "pangolin.subdomain=turnstone"
+      - "pangolin.rules=ACCEPT|CIDR|0.0.0.0/0,ACCEPT|CIDR|::/0"
+      - "pangolin.services=http:console:8090"
     depends_on:
       postgres:
         condition: service_healthy
@@ -131,7 +144,7 @@ services:
     depends_on:
       - console
     ports:
-      - "${CONSOLE_HTTPS_PORT:-8443}:443"
+      - "127.0.0.1:${CONSOLE_HTTPS_PORT:-8443}:443"
       # SearxNG web UI — NOT exposed by default. SearxNG has no auth, so
       # publishing it is an open search proxy and triggers the AGPL-3.0 §13
       # source-offer obligation (see docs/docker.md). Uncomment to opt in:
