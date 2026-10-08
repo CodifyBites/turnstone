@@ -78,7 +78,7 @@ services:
     ports:
       - "${POSTGRES_BIND:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - /docker/appdata/turnstone/postgres-data:/var/lib/postgresql/data
     networks:
       - turnstone-net
     healthcheck:
@@ -150,9 +150,9 @@ services:
       # source-offer obligation (see docs/docker.md). Uncomment to opt in:
       # - "127.0.0.1:${SEARXNG_HTTPS_PORT:-8444}:8444"
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy-data:/data # persist Caddy's local CA and certs across restarts
-      - caddy-config:/config
+      - /docker/appdata/turnstone/Caddyfile:/etc/caddy/Caddyfile:ro
+      - /docker/appdata/turnstone/caddy-data:/data # persist Caddy's local CA and certs across restarts
+      - /docker/appdata/turnstone/caddy-config:/config
     networks:
       - turnstone-net
     restart: unless-stopped
@@ -168,8 +168,8 @@ services:
   searxng:
     image: searxng/searxng:${SEARXNG_IMAGE_TAG:-latest}
     volumes:
-      - ./searxng:/etc/searxng:ro
-      - searxng-cache:/var/cache/searxng # favicon + internal SQLite cache (survives restarts)
+      - /docker/appdata/turnstone/searxng:/etc/searxng:ro
+      - /docker/appdata/turnstone/searxng-cache:/var/cache/searxng # favicon + internal SQLite cache (survives restarts)
     networks:
       - turnstone-net
     healthcheck:
@@ -197,8 +197,8 @@ services:
         $${SKIP_PERMISSIONS:+--skip-permissions}
         $${MCP_CONFIG:+--mcp-config $$MCP_CONFIG}
     volumes:
-      - turnstone-data:/data
-      - ${WORKSPACE_MOUNT:-workspace}:/workspace
+      - /docker/appdata/turnstone/turnstone-data:/data
+      - /docker/appdata/turnstone/workspace:/workspace
     environment:
       TURNSTONE_JWT_SECRET: *jwt-secret
       TURNSTONE_DB_BACKEND: *db-backend
