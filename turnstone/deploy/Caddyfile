@@ -24,6 +24,12 @@
 	grace_period 5s
 }
 
+servers :8090 {
+	listener_wrappers {
+		h2c
+	}
+}
+
 :443 {
 	# on_demand: a port-only site has no fixed name to pre-issue for. It also lets
 	# any client that reaches this port have Caddy issue a cert for a name it
