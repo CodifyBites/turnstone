@@ -37,6 +37,12 @@
     }
 }
 
+:8090 {
+    reverse_proxy console:8090 {
+        flush_interval -1
+    }
+}
+
 # Optional SearxNG web UI on its own port:
 #   browser --h2/HTTPS--> caddy:8444 --h1.1/HTTP--> searxng:8080
 # SearxNG has NO authentication, so whoever reaches this port can search through
