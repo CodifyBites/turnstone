@@ -132,6 +132,7 @@ services:
       - console
     ports:
       - "${CONSOLE_HTTPS_PORT:-8443}:443"
+      - "${TURNSTONE_CONSOLE_HTTP_BIND:-127.0.0.1}:${TURNSTONE_CONSOLE_HTTP_PORT:-8090}:8090"
       # SearxNG web UI — NOT exposed by default. SearxNG has no auth, so
       # publishing it is an open search proxy and triggers the AGPL-3.0 §13
       # source-offer obligation (see docs/docker.md). Uncomment to opt in:
