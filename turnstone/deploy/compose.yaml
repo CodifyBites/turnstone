@@ -224,7 +224,7 @@ services:
       MCP_CONFIG: ${MCP_CONFIG:-}
       SKIP_PERMISSIONS: ${SKIP_PERMISSIONS:-}
       TURNSTONE_NODE_ID: ${TURNSTONE_NODE_ID:-node-1}
-      TURNSTONE_ADVERTISE_URL: ${TURNSTONE_ADVERTISE_URL:-http://server:8080}
+      TURNSTONE_ADVERTISE_URL: ${TURNSTONE_ADVERTISE_URL:-http://turnstone-node-1:8080}
     networks:
       turnstone-net:
         aliases:
