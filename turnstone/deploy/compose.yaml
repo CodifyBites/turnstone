@@ -33,6 +33,9 @@ name: turnstone
 networks:
   turnstone-net:
     driver: bridge
+  proxy:
+    name: proxy
+    external: true
 
 volumes:
   turnstone-data:
