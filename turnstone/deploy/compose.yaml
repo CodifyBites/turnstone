@@ -143,6 +143,7 @@ services:
       - caddy-config:/config
     networks:
       - turnstone-net
+      - proxy
     restart: unless-stopped
 
   # -------------------------------------------------------------------
