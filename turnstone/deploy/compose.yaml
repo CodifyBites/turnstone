@@ -33,10 +33,6 @@ name: turnstone
 networks:
   turnstone-net:
     driver: bridge
-  # Shared Arcane/Pangolin ingress network, managed outside this project.
-  proxy:
-    external: true
-    name: proxy
 
 volumes:
   turnstone-data:
@@ -78,7 +74,7 @@ services:
     ports:
       - "${POSTGRES_BIND:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
     volumes:
-      - /docker/appdata/turnstone/postgres-data:/var/lib/postgresql/data
+      - postgres-data:/var/lib/postgresql/data
     networks:
       - turnstone-net
     healthcheck:
@@ -110,28 +106,10 @@ services:
       TURNSTONE_DB_BACKEND: *db-backend
       TURNSTONE_DB_URL: *db-url
       TURNSTONE_CONSOLE_URL: http://console:8090
-      TURNSTONE_OIDC_ISSUER: ${TURNSTONE_OIDC_ISSUER:?Set TURNSTONE_OIDC_ISSUER in .env}
-      TURNSTONE_OIDC_CLIENT_ID: ${TURNSTONE_OIDC_CLIENT_ID:?Set TURNSTONE_OIDC_CLIENT_ID in .env}
-      TURNSTONE_OIDC_CLIENT_SECRET: ${TURNSTONE_OIDC_CLIENT_SECRET:?Set TURNSTONE_OIDC_CLIENT_SECRET in .env}
-      TURNSTONE_OIDC_REDIRECT_BASE: https://turnstone.prod.codifybites.com
-      TURNSTONE_OIDC_PROVIDER_NAME: Authentik
-      TURNSTONE_OIDC_PASSWORD_ENABLED: "true"
-      TURNSTONE_OIDC_ALLOW_PRIVATE_NETWORK: "true"
-      TURNSTONE_OIDC_ROLE_CLAIM: ${TURNSTONE_OIDC_ROLE_CLAIM:-groups}
-      TURNSTONE_OIDC_ROLE_MAP: ${TURNSTONE_OIDC_ROLE_MAP:-authentik Admins:builtin-admin,devOps:builtin-operator}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
       - turnstone-net
-      - proxy
-    labels:
-      - "arcane.server.hosts=CodeServer"
-      - "pangolin.enable=true"
-      - "pangolin.protected=true"
-      - "pangolin.domain=prod.codifybites.com"
-      - "pangolin.subdomain=turnstone"
-      - "pangolin.rules=ACCEPT|CIDR|0.0.0.0/0,ACCEPT|CIDR|::/0"
-      - "pangolin.services=http:console:8090"
     depends_on:
       postgres:
         condition: service_healthy
@@ -153,15 +131,16 @@ services:
     depends_on:
       - console
     ports:
-      - "127.0.0.1:${CONSOLE_HTTPS_PORT:-8443}:443"
+      - "${CONSOLE_HTTPS_PORT:-8443}:443"
+      - "${TURNSTONE_CONSOLE_HTTP_BIND:-127.0.0.1}:${TURNSTONE_CONSOLE_HTTP_PORT:-8090}:8090"
       # SearxNG web UI — NOT exposed by default. SearxNG has no auth, so
       # publishing it is an open search proxy and triggers the AGPL-3.0 §13
       # source-offer obligation (see docs/docker.md). Uncomment to opt in:
       # - "127.0.0.1:${SEARXNG_HTTPS_PORT:-8444}:8444"
     volumes:
-      - /docker/appdata/turnstone/Caddyfile:/etc/caddy/Caddyfile:ro
-      - /docker/appdata/turnstone/caddy-data:/data # persist Caddy's local CA and certs across restarts
-      - /docker/appdata/turnstone/caddy-config:/config
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data # persist Caddy's local CA and certs across restarts
+      - caddy-config:/config
     networks:
       - turnstone-net
     restart: unless-stopped
@@ -177,8 +156,8 @@ services:
   searxng:
     image: searxng/searxng:${SEARXNG_IMAGE_TAG:-latest}
     volumes:
-      - /docker/appdata/turnstone/searxng:/etc/searxng:ro
-      - /docker/appdata/turnstone/searxng-cache:/var/cache/searxng # favicon + internal SQLite cache (survives restarts)
+      - ./searxng:/etc/searxng:ro
+      - searxng-cache:/var/cache/searxng # favicon + internal SQLite cache (survives restarts)
     networks:
       - turnstone-net
     healthcheck:
@@ -206,8 +185,8 @@ services:
         $${SKIP_PERMISSIONS:+--skip-permissions}
         $${MCP_CONFIG:+--mcp-config $$MCP_CONFIG}
     volumes:
-      - /docker/appdata/turnstone/turnstone-data:/data
-      - /docker/appdata/turnstone/workspace:/workspace
+      - turnstone-data:/data
+      - ${WORKSPACE_MOUNT:-workspace}:/workspace
     environment:
       TURNSTONE_JWT_SECRET: *jwt-secret
       TURNSTONE_DB_BACKEND: *db-backend
@@ -223,20 +202,10 @@ services:
       SKIP_PERMISSIONS: ${SKIP_PERMISSIONS:-}
       TURNSTONE_NODE_ID: ${TURNSTONE_NODE_ID:-node-1}
       TURNSTONE_ADVERTISE_URL: ${TURNSTONE_ADVERTISE_URL:-http://server:8080}
-      TURNSTONE_OIDC_ISSUER: ${TURNSTONE_OIDC_ISSUER:?Set TURNSTONE_OIDC_ISSUER in .env}
-      TURNSTONE_OIDC_CLIENT_ID: ${TURNSTONE_OIDC_CLIENT_ID:?Set TURNSTONE_OIDC_CLIENT_ID in .env}
-      TURNSTONE_OIDC_CLIENT_SECRET: ${TURNSTONE_OIDC_CLIENT_SECRET:?Set TURNSTONE_OIDC_CLIENT_SECRET in .env}
-      TURNSTONE_OIDC_REDIRECT_BASE: https://turnstone.prod.codifybites.com
-      TURNSTONE_OIDC_PROVIDER_NAME: Authentik
-      TURNSTONE_OIDC_PASSWORD_ENABLED: "true"
-      TURNSTONE_OIDC_ALLOW_PRIVATE_NETWORK: "true"
-      TURNSTONE_OIDC_ROLE_CLAIM: ${TURNSTONE_OIDC_ROLE_CLAIM:-groups}
-      TURNSTONE_OIDC_ROLE_MAP: ${TURNSTONE_OIDC_ROLE_MAP:-authentik Admins:builtin-admin,devOps:builtin-operator}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
       - turnstone-net
-      - proxy
     depends_on:
       postgres:
         condition: service_healthy
