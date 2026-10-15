@@ -22,6 +22,9 @@
 	# Close open dashboard streams on shutdown rather than waiting on them until
 	# Docker's stop timeout kills Caddy.
 	grace_period 5s
+	servers :8090 {
+		protocols h1 h2c
+	}
 }
 
 :443 {
@@ -32,13 +35,13 @@
 	tls {
 		on_demand
 	}
-    reverse_proxy console:8090 {
+    reverse_proxy h2c://console:8090 {
         flush_interval -1
     }
 }
 
 :8090 {
-    reverse_proxy console:8090 {
+    reverse_proxy h2c://console:8090 {
         flush_interval -1
     }
 }
