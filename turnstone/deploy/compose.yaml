@@ -113,7 +113,6 @@ services:
       - "host.docker.internal:host-gateway"
     networks:
       - turnstone-net
-      - proxy
     depends_on:
       postgres:
         condition: service_healthy
