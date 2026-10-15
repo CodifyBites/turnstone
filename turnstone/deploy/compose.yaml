@@ -225,10 +225,10 @@ services:
       SKIP_PERMISSIONS: ${SKIP_PERMISSIONS:-}
       TURNSTONE_NODE_ID: ${TURNSTONE_NODE_ID:-node-1}
       TURNSTONE_ADVERTISE_URL: ${TURNSTONE_ADVERTISE_URL:-http://server:8080}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     networks:
-      - turnstone-net
+      turnstone-net:
+        aliases:
+          - turnstone-node-1
     depends_on:
       postgres:
         condition: service_healthy
