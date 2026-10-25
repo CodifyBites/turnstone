@@ -1,0 +1,45 @@
+# Turnstone execution-only node for Unraid. Console and PostgreSQL remain on CodeServer.
+name: turnstone-unraid-node
+
+services:
+  server:
+    image: ghcr.io/turnstonelabs/turnstone:${TURNSTONE_IMAGE_TAG:-latest}
+    command:
+      - sh
+      - -c
+      - >-
+        turnstone-server --host 0.0.0.0 --port 8080
+        $${SKIP_PERMISSIONS:+--skip-permissions}
+        $${MCP_CONFIG:+--mcp-config $$MCP_CONFIG}
+    ports:
+      - "${TURNSTONE_NODE_BIND:-0.0.0.0}:${TURNSTONE_NODE_PORT:-8080}:8080"
+    volumes:
+      - /mnt/user/appdata/turnstone-node/turnstone-data:/data
+      - /mnt/user/appdata/turnstone-node/workspace:/workspace
+    environment:
+      TURNSTONE_JWT_SECRET: ${TURNSTONE_JWT_SECRET:?required}
+      TURNSTONE_DB_BACKEND: ${TURNSTONE_DB_BACKEND:-postgresql}
+      TURNSTONE_DB_URL: ${TURNSTONE_DB_URL:?required}
+      TURNSTONE_NODE_ID: ${TURNSTONE_NODE_ID:-unraid-node-1}
+      TURNSTONE_ADVERTISE_URL: ${TURNSTONE_ADVERTISE_URL:?required}
+      TURNSTONE_CONSOLE_URL: ${TURNSTONE_CONSOLE_URL:?required}
+      TURNSTONE_SEARXNG_URL: ${TURNSTONE_SEARXNG_URL:-}
+      TURNSTONE_OIDC_ISSUER: ${TURNSTONE_OIDC_ISSUER:-}
+      TURNSTONE_OIDC_CLIENT_ID: ${TURNSTONE_OIDC_CLIENT_ID:-}
+      TURNSTONE_OIDC_CLIENT_SECRET: ${TURNSTONE_OIDC_CLIENT_SECRET:-}
+      TURNSTONE_OIDC_PROVIDER_NAME: ${TURNSTONE_OIDC_PROVIDER_NAME:-Authentik}
+      TURNSTONE_OIDC_REDIRECT_BASE: ${TURNSTONE_OIDC_REDIRECT_BASE:-https://turnstone.prod.codifybites.com}
+      TURNSTONE_OIDC_ALLOW_PRIVATE_NETWORK: ${TURNSTONE_OIDC_ALLOW_PRIVATE_NETWORK:-true}
+      TURNSTONE_OIDC_ROLE_CLAIM: ${TURNSTONE_OIDC_ROLE_CLAIM:-groups}
+      TURNSTONE_OIDC_ROLE_MAP: ${TURNSTONE_OIDC_ROLE_MAP:-}
+      TURNSTONE_OIDC_PASSWORD_ENABLED: ${TURNSTONE_OIDC_PASSWORD_ENABLED:-true}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-dummy}
+      MCP_CONFIG: ${MCP_CONFIG:-}
+      SKIP_PERMISSIONS: ${SKIP_PERMISSIONS:-}
+    healthcheck:
+      test: ["CMD", "python", "/usr/local/bin/healthcheck.py", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
